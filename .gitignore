@@ -1,0 +1,5 @@
+/data/
+/outputs/
+/processed/
+/.venv/
+__pycache__/
