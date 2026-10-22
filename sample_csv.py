@@ -67,7 +67,7 @@ def sample_csv(source_path: Path, output_path: Path, rows: int, seed: int) -> No
                 position = rng.randrange(seen)
                 if position < rows:
                     reservoir[position] = (record_number, row)
-            if seen % 5_000_000 == 0:
+            if seen % 100_000 == 0:
                 print(f"  Read {seen:,} data rows ...", flush=True)
 
     if seen < rows:
@@ -98,7 +98,7 @@ def main(argv=None) -> None:
 
     try:
         for name, source_path in SOURCES.items():
-            output_path = PROJECT_ROOT / "processed" / f"{name}_sample_{args.rows}.csv"
+            output_path = PROJECT_ROOT / "processed_samples" / f"{name}_sample_{args.rows}.csv"
             sample_csv(source_path, output_path, args.rows, args.seed)
     except (OSError, ValueError, csv.Error) as error:
         parser.exit(1, f"Sampling failed: {error}\n")
