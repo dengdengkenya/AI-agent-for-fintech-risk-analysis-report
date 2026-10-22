@@ -1,3 +1,78 @@
+# Local report agent demo (小贷风控 / 营销报告助手)
+
+A demo AI agent that writes monthly analysis reports in Chinese for the risk
+model team and the marketing model team of a small-loan lender.
+
+- **Data never leaves the machine.** The model is an open-weight Qwen model
+  served by [Ollama](https://ollama.com) on the same laptop or server. There
+  is no code path to Claude, OpenAI or any hosted LLM API.
+- **The model never calculates.** SQL and pandas compute every number
+  (vintage, roll rates, KS/AUC/PSI, funnel, CAC, ROI, response lift). The
+  model picks which analyses fit the request and writes the narrative from
+  short summary tables. Afterwards every number in the narrative is checked
+  against the computed results, and unmatched numbers are listed for review.
+- **One setting changes the model.** `OLLAMA_HOST` and `OLLAMA_MODEL` (in
+  `.env` or the environment) switch between the laptop, an Aliyun GPU server,
+  and a customer's server.
+- **Synthetic data.** `report_agent/synthetic_data.py` generates a fake
+  lender (45k loans issued 2025-01 to 2026-06, five acquisition channels, a
+  credit score, monthly DPD buckets, an SMS reactivation campaign). No row is
+  a real customer. Every report carries a 演示数据 warning.
+
+### Run on the Windows laptop
+
+1. Install Ollama for Windows from https://ollama.com/download, then in
+   PowerShell: `ollama pull qwen3:8b` (about 5 GB). If the download is slow,
+   see step 5 of the [Aliyun guide](docs/aliyun_ecs_setup.md) for pulling
+   from ModelScope (魔搭) instead.
+2. In this project folder:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env          # edit OLLAMA_MODEL here to try other models
+
+.\.venv\Scripts\python.exe -m report_agent check        # is the model there, how fast is it
+.\.venv\Scripts\python.exe -m report_agent report --team risk
+.\.venv\Scripts\python.exe -m report_agent report --team marketing --request "重点看各渠道ROI和短信召回效果"
+```
+
+The first `report` builds the synthetic database in `outputs/` (a few
+seconds). Reports are written to `outputs/reports/` as Markdown, with the
+computed tables, the number check and a timing table at the end. The console
+also prints timing per step: model load time, prompt tokens per second and
+output tokens per second. On a CPU-only laptop expect a few minutes per
+report with an 8B model; this is an estimate, not a measurement.
+
+Other commands:
+
+```powershell
+python -m report_agent list                                   # available analyses
+python -m report_agent report --team risk --no-llm            # numbers only, no model
+python -m report_agent report --team risk --analyses vintage,score_monitoring
+python -m report_agent build-data                             # regenerate synthetic data
+```
+
+### How it works
+
+| Step | Who | File |
+|---|---|---|
+| Plan: choose analyses for the request (JSON) | local model | `report_agent/agent.py` |
+| Compute: run SQL/pandas analyses | Python | `report_agent/analyses.py` |
+| Write: Chinese narrative from tables and pre-computed facts | local model | `report_agent/agent.py` |
+| Check: flag narrative numbers not found in results | Python | `report_agent/agent.py` |
+
+When `--request` is empty the agent skips planning and uses the team's
+default set of analyses. To add an analysis, write a function in
+`analyses.py` returning an `AnalysisResult` and register it in `ANALYSES`.
+
+### Run on Aliyun
+
+See [docs/aliyun_ecs_setup.md](docs/aliyun_ecs_setup.md): a pay-as-you-go GPU
+instance, Ollama, Qwen from ModelScope, and how to stop paying afterwards.
+
+---
+
 # Lending Club CSV preview
 
 ## Create sample CSVs for the repository

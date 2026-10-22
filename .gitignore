@@ -5,3 +5,4 @@
 !/processed/rejected_sample_10000.csv
 /.venv/
 __pycache__/
+/.env
