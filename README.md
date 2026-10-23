@@ -1,5 +1,35 @@
 # Lending Club CSV preview
 
+## Test local Ollama / Qwen3 4B
+
+With Ollama running and `qwen3:4b` installed, run from the project folder:
+
+```powershell
+python .\test_ollama.py
+```
+
+No extra Python packages are required. The script checks the server, confirms
+the model is installed, sends a short prompt, prints the reply and elapsed time,
+and verifies the model is loaded. Exit code `0` means all checks passed; `1`
+means a check failed. This tests connectivity and text generation, not model
+accuracy. The model is kept loaded for five minutes after the test.
+The prompt uses Qwen's [`/no_think` switch](https://qwenlm.github.io/blog/qwen3/#advanced-usages)
+to request a brief reply; any reasoning emitted by the installed model is kept
+separate from the printed answer.
+
+The defaults are `http://localhost:11434`, `qwen3:4b`, and a 180-second generation
+timeout. Override them with `--host`, `--model`, or `--timeout`, for example:
+
+```powershell
+python .\test_ollama.py --model qwen3:4b --timeout 300
+```
+
+If the server is unavailable, open the Ollama app or run `ollama serve`. If the
+model is missing, install it with `ollama pull qwen3:4b` and rerun the test.
+The script uses Ollama's [generate](https://docs.ollama.com/api/generate),
+[model list](https://docs.ollama.com/api/tags), and
+[running models](https://docs.ollama.com/api/ps) endpoints.
+
 ## Create sample CSVs for the repository
 
 Run from the project folder (no additional Python packages needed):
