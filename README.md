@@ -1,5 +1,94 @@
 # Lending Club CSV preview
 
+## Score cutoff simulation: growth versus losses
+
+`score_cutoff_simulation.py` reads `demo.accepted` and `demo.rejected` using
+server-side aggregates and writes a local narrative report. It compares retained
+accepted-loan counts and funded principal, historical charge-offs and unrecovered
+principal, and rejected demand at different numeric score thresholds. It uses
+the existing MySQL dependency and requires MySQL 8.0 or later.
+
+```powershell
+# Read the existing MySQL tables; enter your password locally when prompted:
+.\.venv\Scripts\python.exe .\score_cutoff_simulation.py
+
+# Example historical cohort and risk ceiling (6% is an assumption, not policy):
+.\.venv\Scripts\python.exe .\score_cutoff_simulation.py `
+  --cutoffs 600,640,660,680,700,720,740 --baseline 660 `
+  --start-month 2012-01 --end-month 2015-12 --max-loss-rate 0.06
+
+# Run a walkthrough without MySQL, using clearly labeled artificial aggregates:
+.\.venv\Scripts\python.exe .\score_cutoff_simulation.py --demo `
+  --max-loss-rate 0.06 --output-dir outputs/score_cutoff_demo
+```
+
+The default outputs are `outputs/score_cutoff/report.md` and `aggregates.json`.
+The JSON contains the aggregate evidence, calculations, assumptions and SQL for
+review. Reruns replace those files; choose `--output-dir` to preserve separate
+runs. Relative output paths resolve from the project root. The report is generated
+with deterministic Python prose; it does not need Ollama or send data to an AI
+service. `--demo` results are synthetic and must not be presented as MySQL findings.
+
+Connection options match the importer: `--host`, `--port`, `--user`, `--database`
+(or `--schema`), `--accepted-table`, and `--rejected-table`. Passwords come only
+from an interactive prompt or the local `MYSQL_PASSWORD` environment variable.
+A SELECT-only account is sufficient; both sources must be InnoDB tables. The
+script uses a consistent read-only transaction and never changes database data.
+`--print-sql` shows query templates and parameters without a connection. Only
+grouped counts, sums and month bounds reach Python; no borrower records are
+exported. This is aggregate-only processing, not an anonymization guarantee.
+
+Accepted scores use the midpoint of **original** FICO bounds. Performance uses
+only `Fully Paid` and `Charged Off` loans; open, unknown and legacy statuses are
+excluded. The loss proxy is `max(funded_amnt - total_rec_prncp - recoveries, 0)`
+for financially complete charged-off loans, divided by funded principal across
+all financially complete terminal loans. Fully paid loans contribute zero loss.
+It excludes collection costs, interest and fees and is not an annualized or
+accounting loss measure. Invalid text is excluded before numeric conversion;
+missing financial values are never silently treated as zero. Coverage and
+exclusions are shown. Rates require at least 100 relevant outcomes by default
+(`--min-outcomes`), which is a demo stability check, not statistical validation.
+
+The source dictionary (`data/LCDataDictionary.xlsx`) says rejected `Risk_Score`
+is FICO before **November 5, 2013** and VantageScore after that date. It does not
+specify the VantageScore version or range. The default report therefore shows
+rejected numeric score screens separately and excludes scores outside 300–850;
+it does not claim comparable scores or known repayment outcomes. To demonstrate
+a hypothetical expansion, explicitly supply both assumptions:
+
+```powershell
+# Illustrative assumptions: equal score scales, 25% take-up, 15% lifetime loss.
+.\.venv\Scripts\python.exe .\score_cutoff_simulation.py `
+  --assume-comparable-scores --take-up-rate 0.25 --rejected-loss-rate 0.15
+```
+
+This scenario applies take-up to screened rejected applications with valid
+requested amounts, assumes full requested funding, and estimates new losses
+from the supplied rate. It includes all qualifying rejects at each threshold,
+not just those between that threshold and baseline. It does not infer rejected
+risk from accepted borrowers or add unlike observation windows into a portfolio
+loss forecast. The optional `--max-loss-rate` chooses a candidate based **only on
+historical accepted losses**, with complete terminal financial coverage; it is
+not a recommendation to approve rejected applicants.
+
+The baseline defaults to 660 as an illustrative comparison, not verified policy.
+Growth means retained historical funded loans, not a measured approval rate.
+Monthly filters use accepted issue month and rejected application month; they
+do not reconstruct repayment performance as of a historical date. Resolved-loan
+selection, different seasoning, incomplete/duplicate imports, and score changes
+limit interpretation. Use a sufficiently mature, comparable cohort for review.
+The script does not certify import completeness or calculate profit.
+
+Each source is scanned once; text conversion and aggregation on large full
+tables can take several minutes or longer. Month filters do not avoid that scan.
+`--query-timeout` defaults to 600 seconds per query. Only aggregate result groups
+are held in Python memory.
+
+```powershell
+# Offline arithmetic, data-boundary and report checks:
+.\.venv\Scripts\python.exe -m unittest test_score_cutoff_simulation -v
+```
+
 ## Test local Ollama / Qwen3 4B
 
 With Ollama running and `qwen3:4b` installed, run from the project folder:
