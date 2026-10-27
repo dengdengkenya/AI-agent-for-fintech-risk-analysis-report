@@ -57,6 +57,87 @@ ignored. After reviewing the samples, add them and the script with:
 git add sample_csv.py processed/accepted_sample_10000.csv processed/rejected_sample_10000.csv .gitignore README.md
 ```
 
+## Import accepted and rejected CSVs into MySQL
+
+`import_csv_to_mysql.py` streams both full source files from `data/` into separate
+tables: `demo.accepted` (151 columns) and `demo.rejected` (9 columns). It prefers
+the extracted CSVs and falls back to `.csv.gz` files without extracting them.
+Source files are opened read-only, and relative input paths are resolved from
+the project folder even when you launch the script elsewhere.
+
+```powershell
+# Install the existing project dependency once:
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Check the first 100 rows from each file without connecting to MySQL:
+.\.venv\Scripts\python.exe .\import_csv_to_mysql.py --dry-run --rows 100
+
+# Import both complete datasets; enter your MySQL password at the prompt:
+.\.venv\Scripts\python.exe .\import_csv_to_mysql.py
+```
+
+The default connection is `localhost:3306`, user `root`. Use `--host`, `--port`,
+`--user`, and `--database` (or `--schema`) to change it. You can set
+`MYSQL_PASSWORD` for unattended execution; passwords are never saved in the
+script or passed as command-line arguments. The MySQL user needs permission to
+create the database/tables if missing, read the destination tables, and insert.
+
+To import the existing sample files instead, choose separate sample tables:
+
+```powershell
+.\.venv\Scripts\python.exe .\import_csv_to_mysql.py `
+  --accepted-csv processed_samples/accepted_sample_10000.csv `
+  --rejected-csv processed_samples/rejected_sample_10000.csv `
+  --accepted-table accepted_sample --rejected-table rejected_sample
+```
+
+Use `--rows 100` to import at most 100 eligible rows per file. Omit `--rows` to
+import every row. `--batch-size 1000` controls the maximum rows per transaction;
+batches also shrink to fit the server's packet limit. Progress is printed during
+imports. Both input headers and existing destination schemas are checked before
+any data rows are inserted.
+
+CSV headers become the exact MySQL column names, including the rejected file's
+spaces and hyphens. All columns are nullable `LONGTEXT` with `utf8mb4` encoding;
+numbers, percentages, dates, and leading zeros remain source text. Empty CSV
+fields become SQL `NULL`. This creates raw import tables; cast fields when you
+need numeric or date calculations. Blank records and accepted funded-total
+footers are skipped; malformed records cause an error.
+
+By default, both destination tables must be new or empty. Nonempty tables are
+rejected to prevent accidental duplicate imports. `--append` explicitly permits
+adding rows and does not deduplicate or resume an interrupted import. Existing
+tables must have the same columns, in CSV order, as nullable `utf8mb4 LONGTEXT`,
+and use InnoDB. The script never drops or truncates tables.
+
+Each successful batch is committed separately. If a later batch fails or you
+interrupt the run, earlier batches (including any completed table) remain. The
+current uncommitted batch is rolled back when possible. If the connection fails
+during a commit, inspect the table because that batch's outcome may be unknown.
+For a clean retry, use new table names or manually clear the intended tables;
+do not use `--append` as a resume mechanism. MySQL commits table creation
+separately from inserted rows.
+
+```sql
+SELECT COUNT(*) FROM demo.accepted;
+SELECT COUNT(*) FROM demo.rejected;
+SELECT id, loan_amnt, loan_status FROM demo.accepted LIMIT 5;
+SELECT `Amount Requested`, `Application Date`, `Loan Title`
+FROM demo.rejected LIMIT 5;
+```
+
+Batch inserts use MySQL Connector/Python's
+[`executemany`](https://dev.mysql.com/doc/connector-python/en/connector-python-api-mysqlcursor-executemany.html)
+with parameterized values and explicit
+[`commit`](https://dev.mysql.com/doc/connector-python/en/connector-python-connectargs.html#connector-python-connectargs-transactions)
+calls.
+
+Run the CSV importer regression checks with:
+
+```powershell
+python -m unittest test_import_csv_to_mysql -v
+```
+
 ## MySQL preview
 
 `preview_csv.py` reads the CSV header and first five data rows from the project's
