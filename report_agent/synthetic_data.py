@@ -13,6 +13,12 @@ Built-in "stories" so the reports have something to find:
   cannot see a hidden risk factor that grows in API导流 traffic, so KS/AUC
   fall in later cohorts.
 - The reactivation response model has real but modest lift over control.
+- A separate application-level table (`applications`) holds every applicant,
+  approved or rejected, with only application-time fields, like Lending
+  Club's rejected file. The current policy is score >= 600 and DTI <= 45%,
+  plus ~12% rejected for other reasons and a few manual exceptions below the
+  cutoff. Applicant DTI rises over time and 广东 grows its share, so the
+  drift report has something to find.
 """
 
 import sqlite3
@@ -36,6 +42,18 @@ CHANNELS = {
     "应用商店": (260, 0.80, 15, 0.78, 0.030, 0.40, 0.55, 0.52),
     "API导流": (300, 1.60, -25, 0.45, 0.0, 0.0, 0.0, 0.30),
     "老客复贷": (60, 0.55, 40, 0.80, 0.0, 0.0, 0.70, 0.75),
+}
+
+POLICY_SCORE_CUTOFF = 600
+POLICY_MAX_DTI = 45.0
+OUTCOME_MONTHS = 6  # an approved application's bad flag is known after 6 months
+
+# region: (share at start, share at end, monthly risk shift)
+REGIONS = {
+    "广东": (0.16, 0.26, 0.15), "江苏": (0.12, 0.11, -0.10), "浙江": (0.11, 0.10, -0.10),
+    "山东": (0.10, 0.09, 0.00), "河南": (0.10, 0.10, 0.10), "四川": (0.09, 0.09, 0.05),
+    "湖北": (0.08, 0.07, 0.00), "福建": (0.07, 0.06, -0.05), "湖南": (0.07, 0.06, 0.05),
+    "其他": (0.10, 0.06, 0.05),
 }
 
 ROLL_FORWARD = {  # probability of rolling to the next bucket, else cure
@@ -121,7 +139,40 @@ def generate(seed: int = 2026) -> dict[str, pd.DataFrame]:
         "loans": loans.drop(columns="_hazard"),
         "performance": performance,
         "reactivation_leads": _reactivation_campaigns(rng),
+        "applications": _applications(rng),
     }
+
+
+def _applications(rng) -> pd.DataFrame:
+    """All applicants, approved and rejected, with application-time fields only."""
+    frames = []
+    next_id = 1
+    names = list(REGIONS)
+    for m_idx, month in enumerate(ISSUE_MONTHS):
+        trend = m_idx / (len(ISSUE_MONTHS) - 1)
+        n = int(rng.normal(9000 + 150 * m_idx, 300))
+        shares = np.array([a + (b - a) * trend for a, b, _ in REGIONS.values()])
+        region = rng.choice(names, n, p=shares / shares.sum())
+        z = rng.normal(0, 1, n) + 0.20 * trend + np.array([REGIONS[r][2] for r in region])
+        score = np.clip(np.round(640 - 55 * (0.8 * z + 0.6 * rng.normal(0, 1, n))), 350, 900)
+        dti = np.clip(np.round(rng.gamma(4, 6.5, n) + 4 * z + 8 * trend, 1), 0, 95)
+        amount = np.clip(np.round(rng.lognormal(np.log(9000), 0.6, n), -2), 1000, 50000)
+        emp_years = np.clip(np.round(rng.gamma(2, 2, n) - 0.5 * z), 0, 10).astype(int)
+
+        passes = (score >= POLICY_SCORE_CUTOFF) & (dti <= POLICY_MAX_DTI)
+        other_reject = rng.random(n) < 0.12  # fraud checks, incomplete documents, etc.
+        exception = ~passes & (score >= 560) & (dti <= 55) & (rng.random(n) < 0.05)
+        approved = (passes & ~other_reject) | exception
+        p_bad = 1 / (1 + np.exp(-(-2.9 + 1.0 * z + 0.035 * (dti - 30))))
+        known = (OBSERVATION_END - month).n >= OUTCOME_MONTHS
+        bad = np.where(approved & known, (rng.random(n) < p_bad).astype(float), np.nan)
+        frames.append(pd.DataFrame({
+            "app_id": np.arange(next_id, next_id + n), "app_month": str(month),
+            "amount": amount, "score": score, "dti": dti, "region": region,
+            "emp_years": emp_years, "approved": approved.astype(int), "bad": bad,
+        }))
+        next_id += n
+    return pd.concat(frames, ignore_index=True)
 
 
 def _simulate_performance(loans: pd.DataFrame, rng) -> pd.DataFrame:
@@ -223,10 +274,15 @@ def build_database(path: Path, seed: int = 2026) -> dict[str, int]:
             frame.to_sql(name, conn, index=False)
         conn.execute("CREATE INDEX idx_perf_loan ON performance(loan_id, mob)")
         conn.execute("CREATE INDEX idx_perf_month ON performance(stat_month)")
+        conn.execute("CREATE INDEX idx_app_month ON applications(app_month)")
         pd.DataFrame([{
             "key": "notice",
             "value": "SYNTHETIC DATA 合成数据 - randomly generated, not real customers",
-        }, {"key": "seed", "value": str(seed)},
-            {"key": "observation_end", "value": str(OBSERVATION_END)}]).to_sql("_meta", conn, index=False)
+        }, {"key": "source", "value": "synthetic"},
+            {"key": "seed", "value": str(seed)},
+            {"key": "observation_end", "value": str(OBSERVATION_END)},
+            {"key": "policy_score_cutoff", "value": str(POLICY_SCORE_CUTOFF)},
+            {"key": "policy_max_dti", "value": str(POLICY_MAX_DTI)},
+            {"key": "outcome_definition", "value": f"放款后{OUTCOME_MONTHS}个月内曾逾期30+"}]).to_sql("_meta", conn, index=False)
     tmp.replace(path)
     return {name: len(frame) for name, frame in tables.items()}

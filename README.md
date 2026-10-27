@@ -16,13 +16,15 @@ model team and the marketing model team of a small-loan lender.
   and a customer's server.
 - **Synthetic data.** `report_agent/synthetic_data.py` generates a fake
   lender (45k loans issued 2025-01 to 2026-06, five acquisition channels, a
-  credit score, monthly DPD buckets, an SMS reactivation campaign). No row is
+  credit score, monthly DPD buckets, an SMS reactivation campaign, and
+  ~185k applications including rejected ones). No row is
   a real customer. Every report carries a 演示数据 warning.
 
 ### Run on the Windows laptop
 
 1. Install Ollama for Windows from https://ollama.com/download, then in
-   PowerShell: `ollama pull qwen3:8b` (about 5 GB). If the download is slow,
+   PowerShell: `ollama pull qwen3:4b` (about 2.5 GB; `qwen3:8b` writes better but is
+   about twice as slow on CPU). If the download is slow,
    see step 5 of the [Aliyun guide](docs/aliyun_ecs_setup.md) for pulling
    from ModelScope (魔搭) instead.
 2. In this project folder:
@@ -42,12 +44,62 @@ seconds). Reports are written to `outputs/reports/` as Markdown, with the
 computed tables, the number check and a timing table at the end. The console
 also prints timing per step: model load time, prompt tokens per second and
 output tokens per second. On a CPU-only laptop expect a few minutes per
-report with an 8B model; this is an estimate, not a measurement.
+report with a 4B-8B model; this is an estimate, not a measurement.
+
+### Policy reports: cutoff simulation, approval funnel, applicant drift
+
+`--team policy` (风险策略团队) runs three reports on *all* applications,
+approved and rejected, using only the fields both have at application time
+(amount, month, score, DTI, region, years employed):
+
+- **授信策略模拟 (cutoff_simulation)**: move the score cutoff and/or the DTI
+  limit and see approvals, approved amount and the bad rate before and
+  after, the swap-in / swap-out groups, and a cutoff sensitivity table.
+  Swap-outs were approved, so their bad rate is observed. Swap-ins were
+  rejected and never repaid anything, so their bad rate is a reject-inference
+  estimate from accepted loans (logistic regression on score + DTI) and is
+  always labelled 估算, with a +30% stress case. Manual exceptions stay
+  approved; rejected applicants who already passed the old rule are treated
+  as rejected for another reason and are not swapped in.
+- **申请审批漏斗 (approval_funnel)**: volume and approval rate over time, by
+  score band and by region.
+- **申请客群偏移 (applicant_drift)**: PSI of recent applicants against the
+  same months a year earlier, and against the applicants actually approved.
+
+```powershell
+# the scenario can come from the request (the model or a regex reads it) ...
+.\.venv\Scripts\python.exe -m report_agent report --team policy --request "如果把评分线提高到620分，通过率和坏账率会怎样？"
+# ... or from flags, which win over the request
+.\.venv\Scripts\python.exe -m report_agent report --team policy --score-cutoff 580 --max-dti 50
+```
+
+With no scenario the simulation tries the current cutoff + 20.
+
+**On the real Lending Club files.** `load-lendingclub` streams
+`data/accepted_2007_to_2018Q4.csv.gz` and `data/rejected_2007_to_2018Q4.csv.gz`
+into `outputs/lending_club.db` (only the shared columns; bad = Charged Off,
+Default or Late 31-120 days, unknown while Current). `--frac 0.1` keeps a
+random 10% of both files, which keeps the approval rate right and makes
+reports take seconds instead of minutes. Only the policy reports run on this
+database; the others need the synthetic loans/performance tables.
+
+```powershell
+.\.venv\Scripts\python.exe -m report_agent load-lendingclub --frac 0.1
+.\.venv\Scripts\python.exe -m report_agent report --team policy --db outputs\lending_club.db --score-cutoff 680
+# quick check on the 10,000-row samples (approval rate is not real: both files are sampled to 10,000)
+.\.venv\Scripts\python.exe -m report_agent load-lendingclub --accepted processed_samples\accepted_sample_10000.csv --rejected processed_samples\rejected_sample_10000.csv --db outputs\lc_sample.db
+```
+
+Lending Club's policy is not stored in the data, so the current cutoff and
+DTI limit are inferred from approved loans (1st percentile of score, 99th
+of DTI) and the report says so. Many rejected applications after 2016 have no
+Risk_Score; they are left out of the simulation and the report states the share.
+Tests: `python -m unittest test_report_agent_policy -v`.
 
 Other commands:
 
 ```powershell
-python -m report_agent list                                   # available analyses
+python -m report_agent list                                   # available analyses (risk / policy / marketing)
 python -m report_agent report --team risk --no-llm            # numbers only, no model
 python -m report_agent report --team risk --analyses vintage,score_monitoring
 python -m report_agent build-data                             # regenerate synthetic data

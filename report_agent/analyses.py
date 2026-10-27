@@ -5,54 +5,29 @@ plus pre-computed comparison sentences ("facts") and only writes the prose.
 Add a new analysis by writing a function and registering it in ANALYSES.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import sqlite3
 from typing import Callable
 
 import numpy as np
 import pandas as pd
 
+from .common import AnalysisResult, _q, money, pct, pp
+from .policy import applicant_drift, approval_funnel, cutoff_simulation
+
 
 BAD_BUCKETS = "('M2','M3','M4+')"  # 30+ DPD
-
-
-@dataclass
-class AnalysisResult:
-    key: str
-    title: str
-    table: pd.DataFrame  # already formatted for display
-    facts: list[str] = field(default_factory=list)
-    note: str = ""  # definition of the metric, shown under the table
 
 
 @dataclass(frozen=True)
 class Analysis:
     key: str
-    team: str  # "risk" or "marketing"
+    team: str  # "risk", "policy" or "marketing"
     title: str
     description: str  # shown to the model when it plans the report
-    run: Callable[[sqlite3.Connection], AnalysisResult]
-
-
-def pct(x, digits=2) -> str:
-    return "-" if pd.isna(x) else f"{x * 100:.{digits}f}%"
-
-
-def pp(x) -> str:
-    """Percentage-point difference."""
-    return f"{x * 100:+.2f}个百分点"
-
-
-def money(x) -> str:
-    if pd.isna(x):
-        return "-"
-    if abs(x) >= 1e4:
-        return f"{x / 1e4:,.1f}万"
-    return f"{x:,.0f}"
-
-
-def _q(conn, sql, params=()) -> pd.DataFrame:
-    return pd.read_sql_query(sql, conn, params=params)
+    run: Callable[..., AnalysisResult]
+    tables: tuple[str, ...] = ("loans", "performance")  # needed in the database
+    takes_scenario: bool = False  # run(conn, scenario) instead of run(conn)
 
 
 def _bad_by_mob6(conn) -> pd.DataFrame:
@@ -392,20 +367,32 @@ def reactivation_lift(conn) -> AnalysisResult:
                           "对照组为随机保留10%不发送短信的客户，用于估计短信带来的增量。")
 
 
+PERF, FUNNEL, LEADS, APPS = ("performance",), ("funnel",), ("reactivation_leads",), ("applications",)
+
 ANALYSES = {a.key: a for a in [
-    Analysis("portfolio_overview", "risk", "资产组合概览", "近6个月在贷余额、30+/90+余额占比", portfolio_overview),
+    Analysis("portfolio_overview", "risk", "资产组合概览", "近6个月在贷余额、30+/90+余额占比", portfolio_overview, PERF),
     Analysis("vintage", "risk", "Vintage账龄分析", "各放款月批次在MOB3/6/9/12的累计30+逾期率", vintage),
-    Analysis("roll_rates", "risk", "逾期迁徙率", "近6个月C→M1、M1→M2、M2→M3、M3→M4+的余额迁徙率", roll_rates),
+    Analysis("roll_rates", "risk", "逾期迁徙率", "近6个月C→M1、M1→M2、M2→M3、M3→M4+的余额迁徙率", roll_rates, PERF),
     Analysis("score_monitoring", "risk", "评分模型监控", "按放款月的KS、AUC、PSI，判断模型是否衰退或客群偏移", score_monitoring),
     Analysis("channel_risk", "risk", "分渠道风险", "各获客渠道上下半年的占比与MOB6坏率", channel_risk),
     Analysis("score_bands", "risk", "评分段风险与定价", "各评分段的坏率、占比和平均利率", score_bands),
-    Analysis("acquisition_funnel", "marketing", "获客漏斗", "各渠道点击、注册、申请、审批、提款转化率和获客成本", acquisition_funnel),
-    Analysis("acquisition_trend", "marketing", "月度获客趋势", "每月放款笔数、营销费用、获客成本、API导流占比", acquisition_trend),
-    Analysis("channel_roi", "marketing", "渠道ROI", "各渠道已收利息、损失、营销费用和ROI，连接营销与风险", channel_roi),
-    Analysis("reactivation_lift", "marketing", "老客召回响应模型", "短信召回的响应率、分组Lift、对照组增量", reactivation_lift),
+    Analysis("cutoff_simulation", "policy", "授信策略模拟", "调整评分线或DTI上限后，通过率、坏账率、换入换出客群的变化", cutoff_simulation, APPS, True),
+    Analysis("approval_funnel", "policy", "申请审批漏斗", "全部申请（含拒绝）的申请量、通过率，按评分段和地区", approval_funnel, APPS),
+    Analysis("applicant_drift", "policy", "申请客群偏移", "申请人评分、DTI、金额分布相对一年前和相对通过客户的PSI", applicant_drift, APPS),
+    Analysis("acquisition_funnel", "marketing", "获客漏斗", "各渠道点击、注册、申请、审批、提款转化率和获客成本", acquisition_funnel, FUNNEL),
+    Analysis("acquisition_trend", "marketing", "月度获客趋势", "每月放款笔数、营销费用、获客成本、API导流占比", acquisition_trend, FUNNEL),
+    Analysis("channel_roi", "marketing", "渠道ROI", "各渠道已收利息、损失、营销费用和ROI，连接营销与风险", channel_roi, ("loans", "performance", "funnel")),
+    Analysis("reactivation_lift", "marketing", "老客召回响应模型", "短信召回的响应率、分组Lift、对照组增量", reactivation_lift, LEADS),
 ]}
 
 DEFAULT_PLANS = {
     "risk": ["portfolio_overview", "vintage", "roll_rates", "score_monitoring", "channel_risk"],
+    "policy": ["cutoff_simulation", "approval_funnel", "applicant_drift"],
     "marketing": ["acquisition_funnel", "acquisition_trend", "channel_roi", "reactivation_lift"],
 }
+
+
+def available(conn) -> set[str]:
+    """Analyses whose tables exist in this database."""
+    have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    return {k for k, a in ANALYSES.items() if set(a.tables) <= have}

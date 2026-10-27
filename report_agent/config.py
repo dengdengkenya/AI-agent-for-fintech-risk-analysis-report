@@ -48,7 +48,7 @@ def load_settings() -> Settings:
         # Only a local / on-prem address belongs here: no data may leave the
         # company's network, so never point this at a public LLM API.
         ollama_host=get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/"),
-        ollama_model=get("OLLAMA_MODEL", "qwen3:8b"),
+        ollama_model=get("OLLAMA_MODEL", "qwen3:4b"),
         # Qwen3 "thinking" roughly doubles CPU time; off by default.
         ollama_think=get("OLLAMA_THINK", "false").lower() in ("1", "true", "yes"),
         ollama_num_ctx=int(get("OLLAMA_NUM_CTX", "8192")),
