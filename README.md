@@ -89,6 +89,129 @@ are held in Python memory.
 .\.venv\Scripts\python.exe -m unittest test_score_cutoff_simulation -v
 ```
 
+## Callable SQL tools and the LLM tool dictionary
+
+The separate `score_cutoff_tools.py` interface makes the report's SQL operations
+callable by a future LLM host. `score_cutoff_simulation.py` is unchanged and its
+CLI still works independently. No model is contacted by these tools.
+
+`score_cutoff_tool_dictionary.json` is the machine-readable catalog. It includes
+function descriptions, JSON argument schemas and defaults, goal-to-tool guidance,
+examples, output field definitions, cost notes, error handling and interpretation
+rules. This is a function catalog supplied in model context, not model training.
+
+To generate complete report files through these tools, run the separate
+`generate_framework_report.py` entry point:
+
+```powershell
+# Synthetic walkthrough; no MySQL or Ollama required:
+.\.venv\Scripts\python.exe .\generate_framework_report.py --demo --max-loss-rate 0.08
+
+# Historical MySQL report; enter your password locally when prompted:
+.\.venv\Scripts\python.exe .\generate_framework_report.py
+
+# Custom comparison and output folder:
+.\.venv\Scripts\python.exe .\generate_framework_report.py --demo `
+  --cutoffs 640,660,700 --baseline 660 --max-loss-rate 0.08 `
+  --output-dir outputs/framework_custom
+```
+
+The default files are `outputs/framework_report/report.md` and
+`outputs/framework_report/aggregates.json`. Reruns replace those two files;
+choose another `--output-dir` to preserve separate runs. Relative paths resolve
+from the project root. The runner accepts the original report's connection,
+cohort and scenario options, including `--print-sql` for a preview without
+database access or output writes. The example 8% ceiling is an assumption,
+not a lending policy.
+
+It calls `get_score_cutoff_aggregates` once, then reuses the original analysis
+and Markdown renderer. The evidence file retains that same aggregate snapshot,
+results, settings and SQL templates (empty for demo fixtures). Live runs use
+`MYSQL_PASSWORD` or an interactive password prompt; credentials are never
+written to evidence. This produces deterministic reports and does not call Qwen.
+
+| Tool | Use |
+| --- | --- |
+| `inspect_sources` | Inspect table engines and required columns, without scanning loan records. Live mode only. |
+| `preview_score_cutoff_queries` | Inspect SQL templates and bound parameters without connecting. |
+| `get_score_cutoff_aggregates` | Retrieve disjoint score bands for both sources in one consistent read-only snapshot. |
+| `compare_score_cutoffs` | Retrieve aggregates and calculate cumulative scenarios, coverage and an optional candidate. Preferred for comparisons. |
+
+`score_cutoff_sql.py` provides the underlying connection setup, query preview,
+schema inspection and aggregate functions. It reuses the original report's
+query construction; `score_cutoff_tools.py` reuses its calculations. Only the four
+catalogued operations are exposed through the dispatcher. There is no arbitrary
+SQL execution tool and the importer/preview write operations are not exposed.
+
+```powershell
+# Read the complete dictionary without connecting to MySQL:
+.\.venv\Scripts\python.exe .\score_cutoff_tools.py --list-tools
+
+# Execute a model-shaped call on synthetic data; output is JSON:
+'{"cutoffs":[640,660,700],"baseline":660,"max_loss_rate":0.08}' |
+  .\.venv\Scripts\python.exe .\score_cutoff_tools.py --demo `
+    --call compare_score_cutoffs --arguments -
+
+# Inspect the configured live schema (MYSQL_PASSWORD must be set locally):
+.\.venv\Scripts\python.exe .\score_cutoff_tools.py --call inspect_sources
+```
+
+Use the same dispatcher from Python:
+
+```python
+from score_cutoff_tools import (
+    DatabaseConfig, ScoreCutoffTools, get_tool_definitions, load_tool_dictionary,
+)
+
+catalog = load_tool_dictionary()
+definitions = get_tool_definitions()
+runner = ScoreCutoffTools(demo=True)
+response = runner.call_tool("compare_score_cutoffs", {
+    "cutoffs": [640, 660, 700], "baseline": 660, "max_loss_rate": 0.08,
+})
+assert response["ok"], response.get("error")
+print(response["result"]["results"]["candidate_cutoff"])
+
+# For live calls, the application owns connection settings and credentials:
+# runner = ScoreCutoffTools(DatabaseConfig(user="report_reader"))
+# MYSQL_PASSWORD is read from the local process environment; no prompt is used.
+```
+
+For a future Ollama integration, pass `definitions` as the chat request's `tools`
+array and supply `catalog["workflow_guidance"]`, `catalog["interpretation_rules"]`
+and relevant output definitions in the model's context. When the model returns
+a function name and arguments, the host calls `runner.call_tool(name, arguments)`
+and sends the serialized response back as a tool message. The model does not
+execute Python itself. An Ollama agent loop and AI-written report sections are
+not added by this interface.
+
+Arguments can be a Python dictionary or a JSON object string. Unknown fields,
+malformed JSON, duplicate JSON keys, invalid types, nonfinite numbers and invalid
+assumption combinations are rejected before database access. Errors return
+`{"ok": false, "error": {"code": "...", "message": "..."}}`; successful calls
+return `{"ok": true, "result": {...}}`. Direct named methods are also available
+on `runner` and raise exceptions instead of returning the dispatch envelope.
+
+Credentials, database/table names, timeouts and demo mode are controlled by the
+host, not model arguments. Set custom settings through `DatabaseConfig`. A trusted
+application may inject `connection_factory(config)` for its own credential
+management; it must return a fresh connection with a query timeout configured.
+The tools close each connection after use. No tool writes report files or changes
+database data. Existing report output files are untouched.
+
+Live aggregate/comparison calls each scan both sources; do not call both when one
+comparison will satisfy the goal. Schema inspection is optional because each
+aggregate call checks both tables before scanning either. Demo responses are
+labeled `synthetic_demo` and do not support date filters or schema inspection.
+Numerical tables and candidate selection use deterministic Python; interpretation
+must retain the catalog's limitations, including noncomparable rejected scores
+and absent rejected repayment outcomes.
+
+```powershell
+# Offline interface, database-boundary and existing report/importer checks:
+.\.venv\Scripts\python.exe -m unittest test_generate_framework_report test_score_cutoff_tools test_score_cutoff_simulation test_import_csv_to_mysql -v
+```
+
 ## Test local Ollama / Qwen3 4B
 
 With Ollama running and `qwen3:4b` installed, run from the project folder:

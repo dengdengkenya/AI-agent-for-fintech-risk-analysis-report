@@ -1,0 +1,156 @@
+{
+  "schema_version": "1.0",
+  "purpose": "Read-only Lending Club score-cutoff analysis. Choose named Python functions to satisfy a user's goal; do not generate executable SQL or perform the financial arithmetic yourself.",
+  "runtime": {
+    "module": "score_cutoff_tools",
+    "class": "ScoreCutoffTools",
+    "dispatcher": "call_tool(name, arguments)",
+    "tool_definitions": "get_tool_definitions() returns the tools array for an Ollama chat request.",
+    "execution": "The LLM produces a function name and JSON arguments. The Python host validates and executes the call, then supplies the JSON response to the LLM. This catalog does not itself run an agent or contact Ollama.",
+    "configuration": "The host supplies DatabaseConfig and MYSQL_PASSWORD, or a trusted connection_factory. Never request or include credentials, hostnames, table names, SQL text or file paths as tool arguments.",
+    "demo": "The host can set demo=true for artificial fixtures. No database connection is made; monthly filters and schema inspection are unavailable. Query preview still supports date filters.",
+    "side_effects": "Live operations open and close a connection and read metadata or grouped data in a read-only transaction, rolled back on completion. No database writes, report files or LLM network requests occur. Preview makes no database connection.",
+    "success": {"ok": true, "result": "Tool-specific JSON object described in tool_details."},
+    "failure": {"ok": false, "error": {"code": "unknown_tool | invalid_arguments | configuration_error | database_error | execution_error", "message": "Actionable validation message or sanitized execution failure."}},
+    "error_handling": "Fix invalid_arguments using the schema. For configuration/database/execution failures, report the failure and request host assistance if needed; never invent results or silently switch to synthetic data. Raw database error text is intentionally omitted. Do not retry an expensive unchanged query repeatedly."
+  },
+  "workflow_guidance": [
+    {"goal": "Check whether configured sources can support analysis", "tool": "inspect_sources", "guidance": "Metadata only. Check each source's valid and missing_columns fields. Valid schema does not certify a complete or deduplicated import. Aggregate tools validate both schemas themselves, so this is optional."},
+    {"goal": "Review how data will be queried without running a scan", "tool": "preview_score_cutoff_queries", "guidance": "No credentials needed. Returns query templates plus separately bound values; there is no tool to execute arbitrary SQL."},
+    {"goal": "Inspect grouped evidence or pass it to another deterministic computation", "tool": "get_score_cutoff_aggregates", "guidance": "Returns disjoint score bands, not cumulative cutoff totals. Never sum outside_period or invalid_date into a cohort. Prefer compare_score_cutoffs for user-facing comparisons."},
+    {"goal": "Compare growth/loss tradeoffs or find a historical screening candidate", "tool": "compare_score_cutoffs", "guidance": "Preferred one-call operation: fetches both tables consistently and calculates scenarios and quality metrics. Supply the user's max_loss_rate if they want a candidate. Do not call get_score_cutoff_aggregates first: this tool would scan again."},
+    {"goal": "Illustrate lending to rejected applicants", "tool": "compare_score_cutoffs", "guidance": "Only use assume_comparable_scores=true with an explicitly supplied rejected_loss_rate. Take-up and score comparability are assumptions, not inferred facts. Ask for missing assumptions before enabling expansion."}
+  ],
+  "interpretation_rules": [
+    "Always preserve mode: synthetic_demo is artificial, historical_mysql is historical database evidence, and query_preview contains no results.",
+    "Accepted score is the midpoint of original integer FICO endpoints in 300-850. Cutoffs are inclusive. Baseline 660 is an illustrative default, not a verified policy.",
+    "Rejected Risk_Score mixes score systems over time and is not generally comparable to accepted FICO, even when numerically in 300-850. Rejected rows have no repayment outcomes.",
+    "Growth is the change in retained historical accepted loans versus baseline, not a forecast or an approval rate. Application rows are not deduplicated people.",
+    "Counts include open loans; performance uses only Fully Paid and Charged Off outcomes. Terminal-only selection and different seasoning can bias historical rates.",
+    "Loss proxy is unrecovered principal on complete charged-off loans divided by funded principal across complete terminal loans. It excludes interest, fees, collection costs and timing; it is not annualized loss or profit.",
+    "Rates are fractions (0.08 means 8%). loss_rate_change_pp is percentage points. JSON null means unavailable or not assumed; never reinterpret null as zero.",
+    "candidate_cutoff is only a historical screening candidate among tested thresholds. It requires an explicit loss ceiling, sufficient complete outcomes and 100% terminal financial coverage. The ceiling covers accepted historical losses only, not hypothetical expansion.",
+    "Hypothetical rejected lending is based only on explicit score-comparability, take-up and loss assumptions. Do not add its assumed lifetime losses to historical accepted losses as a portfolio forecast.",
+    "Date filters select issue/application cohorts, not repayment observation dates. Metadata and aggregates do not certify import completeness, deduplication or data freshness.",
+    "Only metadata and aggregate data are returned. Aggregates can still expose small groups; this is not an anonymization guarantee."
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "inspect_sources",
+        "description": "Inspect configured accepted/rejected table engines and required columns without scanning loan records. Use to diagnose schema readiness. Does not certify import completeness. Live mode only; aggregate tools perform these checks automatically.",
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "preview_score_cutoff_queries",
+        "description": "Return the accepted and rejected parameterized aggregate SQL templates and bound values without connecting to MySQL. Use to inspect the planned query; this does not execute SQL or return loan results.",
+        "parameters": {
+          "type": "object", "additionalProperties": false, "required": [],
+          "properties": {
+            "cutoffs": {"type": "array", "items": {"type": "integer", "minimum": 300, "maximum": 850}, "minItems": 1, "maxItems": 30, "default": [600, 640, 660, 680, 700, 720, 740], "description": "Inclusive minimum scores. Sorted and deduplicated; baseline is added. At most 30 distinct thresholds including baseline."},
+            "baseline": {"type": "integer", "minimum": 300, "maximum": 850, "default": 660, "description": "Illustrative comparison threshold; automatically included in cutoffs."},
+            "start_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort start; null means earliest available. Accepted issue month, rejected application month."},
+            "end_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort end; null means latest available. Must not precede start_month."}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_score_cutoff_aggregates",
+        "description": "Read both configured source tables in one consistent read-only snapshot and return disjoint score-band counts, sums and month bounds. Use for inspecting aggregate evidence; prefer compare_score_cutoffs for calculated comparisons. Each live call scans both large tables and can take minutes. Synthetic mode uses labeled fixtures and cannot filter months.",
+        "parameters": {
+          "type": "object", "additionalProperties": false, "required": [],
+          "properties": {
+            "cutoffs": {"type": "array", "items": {"type": "integer", "minimum": 300, "maximum": 850}, "minItems": 1, "maxItems": 30, "default": [600, 640, 660, 680, 700, 720, 740], "description": "Inclusive minimum scores. Sorted and deduplicated; at most 30 distinct thresholds including baseline."},
+            "baseline": {"type": "integer", "minimum": 300, "maximum": 850, "default": 660, "description": "Comparison threshold included in the band boundaries; not a verified current policy."},
+            "start_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort start, or null. Unavailable for synthetic fixtures."},
+            "end_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort end, or null; must not precede start_month. Unavailable for synthetic fixtures."}
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "compare_score_cutoffs",
+        "description": "Fetch both aggregate sources and deterministically calculate cumulative cutoff scenarios, baseline changes, coverage and an optional historical screening candidate. Preferred tool for growth/loss comparisons; do not calculate the rates yourself. Each live call scans both tables. Rejected expansion requires explicit assumptions and is never a measured loss forecast.",
+        "parameters": {
+          "type": "object", "additionalProperties": false, "required": [],
+          "properties": {
+            "cutoffs": {"type": "array", "items": {"type": "integer", "minimum": 300, "maximum": 850}, "minItems": 1, "maxItems": 30, "default": [600, 640, 660, 680, 700, 720, 740], "description": "Inclusive minimum scores to compare. Sorted and deduplicated; baseline added. At most 30 distinct thresholds including baseline."},
+            "baseline": {"type": "integer", "minimum": 300, "maximum": 850, "default": 660, "description": "Comparison threshold, not verified current policy."},
+            "start_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort start, or null. Unavailable for synthetic fixtures."},
+            "end_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort end, or null; must not precede start_month. Unavailable for synthetic fixtures."},
+            "max_loss_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1, "default": null, "description": "User-supplied historical accepted-loss ceiling as a fraction; 0.08 means 8%. Null means do not select a candidate. Does not constrain hypothetical expansion losses."},
+            "min_outcomes": {"type": "integer", "minimum": 1, "default": 100, "description": "Minimum relevant terminal outcomes to display a rate. A demo stability check, not a statistical guarantee."},
+            "assume_comparable_scores": {"type": "boolean", "default": false, "description": "Enable hypothetical rejected lending only when the user explicitly assumes rejected scores match accepted FICO. Requires rejected_loss_rate."},
+            "rejected_loss_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1, "default": null, "description": "Explicit assumed lifetime principal-loss fraction on new rejected lending. Requires assume_comparable_scores=true. Never infer from rejected outcomes, which do not exist."},
+            "take_up_rate": {"type": "number", "minimum": 0, "maximum": 1, "default": 1.0, "description": "Assumed fraction of screened rejected demand with valid amounts funded in full. Values other than 1 require explicit rejected-lending assumptions."}
+          }
+        }
+      }
+    }
+  ],
+  "tool_details": {
+    "inspect_sources": {
+      "returns": "{mode:'historical_mysql',schema_checked:true,sources:{accepted:metadata,rejected:metadata}}. Metadata includes table, engine (null if missing), required_columns, missing_columns and valid. A false valid value is a successful diagnostic, not usable aggregate data.",
+      "example": {"name": "inspect_sources", "arguments": {}},
+      "cost": "Metadata queries only; no full source scan."
+    },
+    "preview_score_cutoff_queries": {
+      "returns": "{mode:'query_preview',settings:{normalized inputs},queries:{accepted:{sql:string,params:array},rejected:{sql:string,params:array}}}. SQL contains placeholders; params supplies their values in order.",
+      "example": {"name": "preview_score_cutoff_queries", "arguments": {"cutoffs": [640, 660, 700], "baseline": 660, "start_month": "2015-01", "end_month": "2015-12"}},
+      "cost": "No database access."
+    },
+    "get_score_cutoff_aggregates": {
+      "returns": "{mode,settings:{normalized inputs},aggregates:{accepted:[band],rejected:[band]},limitations:[string]}. See aggregate_fields. Band totals are disjoint. Use only scope='in_scope' and bucket>=cutoff to produce a cumulative scenario.",
+      "example": {"name": "get_score_cutoff_aggregates", "arguments": {"cutoffs": [640, 660, 700], "baseline": 660}},
+      "cost": "One full aggregate scan per table on each live call. Month filters do not avoid the scan. No cache; both datasets share one snapshot."
+    },
+    "compare_score_cutoffs": {
+      "returns": "{mode,settings:{normalized inputs},results:{quality:{accepted:coverage,rejected:coverage},scenarios:[scenario],baseline:integer,candidate_cutoff:integer|null},limitations:[string]}. Scenarios are sorted by cutoff. See scenario_fields and quality_fields.",
+      "example": {"name": "compare_score_cutoffs", "arguments": {"cutoffs": [640, 660, 700], "baseline": 660, "max_loss_rate": 0.08}},
+      "hypothetical_example": {"name": "compare_score_cutoffs", "arguments": {"cutoffs": [640, 660, 700], "baseline": 660, "assume_comparable_scores": true, "rejected_loss_rate": 0.15, "take_up_rate": 0.25}},
+      "cost": "Same database cost as get_score_cutoff_aggregates, plus small Python calculations; do not call both for the same comparison."
+    }
+  },
+  "aggregate_fields": {
+    "scope": "in_scope, outside_period or invalid_date. Synthetic bands have only in_scope.",
+    "bucket": "Highest tested threshold met; 0 means valid score below all thresholds; -1 means invalid/missing score. These are mutually exclusive bands.",
+    "rows": "Number of source rows in the band, including invalid amounts.",
+    "amount_rows": "Rows with a valid positive funded/requested amount.",
+    "amount_sum": "Sum of valid positive funded amount for accepted or requested amount for rejected, in USD.",
+    "first_month / last_month": "Minimum/maximum parsed cohort month; may be null. Absent from synthetic fixtures.",
+    "terminal_rows": "Accepted only: Fully Paid or Charged Off count.",
+    "charged_off_rows": "Accepted only: Charged Off count.",
+    "performance_rows": "Accepted only: terminal rows with complete valid financial fields.",
+    "performance_principal": "Accepted only: total funded principal across complete terminal rows, the loss denominator in USD.",
+    "loss_amount": "Accepted only: sum of max(funded amount - principal received - recoveries,0) for complete charged-off loans, in USD."
+  },
+  "scenario_fields": {
+    "cutoff": "Inclusive minimum score.",
+    "accepted / rejected": "Cumulative totals for in-scope bands meeting cutoff. They contain the summed count/dollar fields above, not scope or bucket. Rejected performance fields are structural zeros, not measured outcomes.",
+    "accepted_retention_rate": "Retained accepted rows / all in-scope accepted rows with valid scores; fraction or null.",
+    "terminal_share": "Terminal accepted rows / retained accepted rows; fraction or null.",
+    "chargeoff_rate": "Charged Off rows / terminal rows; null below min_outcomes or with zero denominator.",
+    "loss_rate": "loss_amount / performance_principal; null below min_outcomes complete terminal rows or with zero denominator.",
+    "loss_data_coverage": "Complete terminal rows / all terminal rows; fraction or null.",
+    "accepted_count_change / accepted_volume_change": "Signed difference from the accepted-only baseline in rows / USD.",
+    "accepted_growth_rate": "accepted_count_change / baseline accepted rows; fraction or null.",
+    "loss_rate_change_pp": "100 * (scenario loss_rate - baseline loss_rate); percentage points or null.",
+    "assumed_new_loans / assumed_new_principal / assumed_new_loss": "Null without expansion assumptions. Otherwise rejected valid-amount count * take_up_rate; requested USD * take_up_rate; new principal * rejected_loss_rate. Loan counts may be fractional expectations.",
+    "hypothetical_total_loans / hypothetical_count_change": "Present only with expansion assumptions: retained accepted + assumed new loans, and change versus accepted-only baseline. Includes all screened rejects, even at the baseline cutoff."
+  },
+  "quality_fields": {
+    "total_rows": "All source rows, including off-cohort rows.",
+    "in_scope_rows / invalid_date_rows / outside_period_rows": "Mutually exclusive date classifications that sum to total_rows.",
+    "invalid_score_rows / invalid_amount_rows": "Invalid field counts within the cohort; may overlap, so do not add them as distinct exclusions.",
+    "first_month / last_month": "Observed in-scope bounds or null; synthetic fixtures have no month bounds."
+  }
+}
