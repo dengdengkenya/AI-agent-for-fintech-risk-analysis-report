@@ -1,7 +1,6 @@
 /data/
 /outputs/
-/processed/*
-!/processed/accepted_sample_10000.csv
-!/processed/rejected_sample_10000.csv
+/processed/
+/processed_samples/
 /.venv/
 __pycache__/

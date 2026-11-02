@@ -1,4 +1,4 @@
-"""JSON-callable report tools for a future local LLM host.
+"""JSON-callable, read-only MySQL tools used by the local report pipeline.
 
 The host executes calls; the model only chooses a registered name and JSON arguments.
 This module does not contact an LLM, write reports, or accept arbitrary SQL.
@@ -148,11 +148,10 @@ class ScoreCutoffTools:
     It is useful for tests or applications with their own credential management.
     """
 
-    def __init__(self, config=None, *, demo=False, connection_factory=None):
+    def __init__(self, config=None, *, connection_factory=None):
         self.config = config if config is not None else DatabaseConfig()
-        if not isinstance(self.config, DatabaseConfig) or type(demo) is not bool:
-            raise ValueError("Expected DatabaseConfig and a boolean demo flag")
-        self.demo = demo
+        if not isinstance(self.config, DatabaseConfig):
+            raise ValueError("Expected DatabaseConfig")
         self.connection_factory = connection_factory
         self._handlers = {
             "inspect_sources": self.inspect_sources,
@@ -170,14 +169,12 @@ class ScoreCutoffTools:
             start, end = settings["start_month"], settings["end_month"]
             if start and end and start > end:
                 raise ArgumentError("start_month must not be after end_month")
-            if self.demo and name != "preview_score_cutoff_queries" and (start or end):
-                raise ArgumentError("Synthetic fixtures have no monthly detail; omit date filters")
         if name == "compare_score_cutoffs":
             if settings["assume_comparable_scores"] != (settings["rejected_loss_rate"] is not None):
                 raise ArgumentError("Supply assume_comparable_scores=true and rejected_loss_rate together")
             if settings["take_up_rate"] != 1 and not settings["assume_comparable_scores"]:
                 raise ArgumentError("take_up_rate requires explicit rejected-lending assumptions")
-        return SimpleNamespace(**asdict(self.config), **settings, demo=self.demo), settings
+        return SimpleNamespace(**asdict(self.config), **settings), settings
 
     def _connect(self):
         if self.connection_factory is not None:
@@ -188,14 +185,12 @@ class ScoreCutoffTools:
         return database_sql.connect_mysql(self.config, password)
 
     def _aggregates(self, options):
-        if self.demo:
-            return simulation.demo_aggregates(options)
         with closing(self._connect()) as connection:
             return database_sql.fetch_aggregates(connection, options)
 
     def _result(self, settings, **values):
         return {
-            "mode": "synthetic_demo" if self.demo else "historical_mysql",
+            "mode": "historical_mysql",
             "settings": settings,
             **values,
             "limitations": deepcopy(_DICTIONARY["interpretation_rules"]),
@@ -204,8 +199,6 @@ class ScoreCutoffTools:
     def inspect_sources(self, **arguments):
         """Inspect required columns and engines without scanning loan records."""
         self._options("inspect_sources", arguments)
-        if self.demo:
-            raise ArgumentError("Schema inspection requires live mode; demo fixtures have no database schema")
         with closing(self._connect()) as connection:
             sources = database_sql.inspect_sources(connection, self.config)
         return {"mode": "historical_mysql", "schema_checked": True, "sources": sources}
@@ -264,13 +257,12 @@ def main(argv=None):
     action.add_argument("--list-tools", action="store_true", help="Print the full tool dictionary")
     action.add_argument("--call", choices=tuple(_TOOLS), help="Execute one registered tool")
     parser.add_argument("--arguments", default="{}", help="JSON arguments, or '-' to read from stdin")
-    parser.add_argument("--demo", action="store_true", help="Use synthetic fixtures, with no MySQL calls")
     args = parser.parse_args(argv)
     if args.list_tools:
         print(json.dumps(load_tool_dictionary(), indent=2, allow_nan=False))
         return 0
     arguments = sys.stdin.read() if args.arguments == "-" else args.arguments
-    response = ScoreCutoffTools(demo=args.demo).call_tool(args.call, arguments)
+    response = ScoreCutoffTools().call_tool(args.call, arguments)
     print(json.dumps(response, indent=2, allow_nan=False))
     return 0 if response["ok"] else 1
 

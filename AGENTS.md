@@ -2,46 +2,111 @@
 
 ## Project status
 
-Last verified: 2026-10-27.
+Last updated: 2026-11-02.
 
-This is a local Python demo for working with Lending Club accepted and rejected
-loan CSVs. It includes reproducible sampling, a small MySQL preview, a streaming
-MySQL importer, and a separate local Ollama / Qwen3 connectivity check.
+This project generates historical Lending Club reports from existing MySQL
+accepted/rejected tables and adds local Ollama/Qwen interpretation. Reporting
+has no synthetic mode, sample CSV input, or CSV fallback. The local schema is
+named `demo`; that name does not make its imported loan tables synthetic.
 
 `CLAUDE.md` is a relative symbolic link to `AGENTS.md`. Edit `AGENTS.md` to update
 the shared instructions; preserve the link rather than creating a second copy.
 
-Current entry points:
-
-| File | Purpose and current defaults |
+| File | Purpose |
 | --- | --- |
-| `sample_csv.py` | Reservoir sampling of both extracted CSVs; 10,000 rows per file, seed `42`; writes to `processed_samples/`. Uses only the standard library. |
-| `preview_csv.py` | Appends the first five accepted rows to `demo.accepted_preview` on MySQL. Each rerun appends again. |
-| `import_csv_to_mysql.py` | Streams both full datasets into `demo.accepted` and `demo.rejected`; prefers extracted CSVs with gzip fallback; supports validation with `--dry-run`. |
-| `test_import_csv_to_mysql.py` | 11 offline regression tests covering CSV parsing, text preservation, validation, batching, paths, and dry runs. |
-| `test_ollama.py` | Checks local Ollama and generates a short reply using `qwen3:4b` at `http://localhost:11434`; uses only the standard library. |
-| `README.md` | Setup and usage instructions; see the sample-path discrepancy below. |
+| `generate_framework_report.py` | Primary MySQL/Qwen runner; writes `report.md`, `aggregates.json`, and `ollama_analysis.json` to `outputs/framework_report/`. |
+| `score_cutoff_simulation.py` | Shared query construction, deterministic calculations and Markdown rendering; CLI delegates to the same runner with `outputs/score_cutoff/`. |
+| `score_cutoff_sql.py` | MySQL connection, schema checks, and aggregates in a read-only consistent snapshot. |
+| `score_cutoff_tools.py` | Allowlisted JSON-callable MySQL operations and host-controlled configuration. |
+| `score_cutoff_tool_dictionary.json` | Function argument schemas, output definitions, and interpretation rules. |
+| `ollama_analysis.py` | Loopback-only Ollama preflight, structured analysis, evidence validation and rendering. |
+| `import_csv_to_mysql.py` | Separate streaming administrative importer for the real CSV sources; supports `--dry-run`. |
+| `test_*.py` | Offline regression tests; fixtures and fake database/model services are confined to tests. |
 
-Verified locally on the date above:
+The sample generator, CSV preview, standalone Ollama greeting check, and tracked
+sample CSVs have been removed. Do not reintroduce demo sources or silently use
+saved/synthetic aggregates when a database query fails.
 
-- All five source paths listed below exist.
-- The two tracked CSVs under `processed_samples/` each contain 10,000 data rows;
-  accepted has 151 columns and rejected has 9 columns.
-- All 11 importer regression tests pass.
-- An importer dry run validates the first 100 rows of each full source CSV.
+Verified on 2026-11-02: 60 offline tests pass. A live read of `demo.accepted`
+counted 2,260,669 rows and `demo.rejected` counted 27,648,741 rows. Local
+`qwen3:4b` generated analysis from that snapshot; the delivered report's wording
+was reviewed, with its original model draft retained in the evidence file.
+These checks do not certify import completeness or deduplication.
 
-These checks do not establish whether a full MySQL import has completed or
-whether MySQL and Ollama are currently running. Check those separately when the
-task depends on them. The Ollama script is a connectivity and generation check,
-not a test of model accuracy or an integrated loan-analysis agent.
+## Environment and validation
 
-## Project data source
+Run commands from the project root in PowerShell. Use `.venv/Scripts/python.exe`
+(Python 3.13.7). `requirements.txt` pins `mysql-connector-python==26.7.0`, the only
+third-party dependency. The model client uses Python's standard library.
 
-Use `data/` as this project's data source. It is a Windows directory junction
-pointing to `C:\Users\kenny\Documents\lending-club-data`; files are not copied.
-Resolve `data/` relative to the project root, not an arbitrary working directory.
+```powershell
+# Set up only if .venv is absent:
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
-Available inputs:
+# All offline regression tests; no services or credentials needed:
+.\.venv\Scripts\python.exe -m unittest discover -v
+
+# SQL preview; no database/model connection or output writes:
+.\.venv\Scripts\python.exe .\generate_framework_report.py --print-sql
+
+# Live report: reads MySQL and invokes local Qwen; writes local report files:
+.\.venv\Scripts\python.exe .\generate_framework_report.py
+
+# Bounded CSV validation, separate from reporting:
+.\.venv\Scripts\python.exe .\import_csv_to_mysql.py --dry-run --rows 100
+```
+
+Tests create temporary fixtures under `outputs/` and clean them up. Report
+queries scan the full tables even with cohort filters and can take minutes;
+`--query-timeout` defaults to 600 seconds per SELECT. Run live validation when
+needed and report it separately from offline checks. An offline pass does not
+establish current service availability or a complete/deduplicated import.
+
+## Reporting and model boundaries
+
+- Defaults: `localhost:3306`, user `root`, schema `demo`, tables `accepted` and
+  `rejected`. Credentials come from `MYSQL_PASSWORD` or a local terminal prompt,
+  never code, documentation, command-line arguments, model context, or evidence.
+- Source tables must be InnoDB with the required columns. Both are checked
+  before scans. Use parameterized values and quoted identifiers. Report reads
+  share one read-only repeatable snapshot and roll back/close before generation.
+- Only grouped counts, sums, and month bounds leave MySQL. Python calculates
+  all rates, coverage and candidate selection. Missing financial data are not
+  zero. Open/unknown/legacy statuses are excluded from terminal outcome rates.
+- Rejected scores are not generally comparable to original accepted FICO.
+  Rejected repayment outcomes are absent. Optional expansion parameters are
+  explicit user assumptions, disabled by default; never present them as facts.
+- Ollama defaults: `http://localhost:11434`, `qwen3:4b`, 300 seconds per request,
+  at most one validation retry, temperature zero, thinking disabled, five-minute
+  keep-alive. Preflight verifies an installed local model before database scans.
+- Endpoint must be loopback HTTP. Disable proxies and redirects; reject cloud
+  models. Never fall back to an external AI service. No model-directed SQL or
+  tool execution occurs. Qwen receives only bounded deterministic aggregate facts.
+- Require short structured sections and valid evidence references. Numeric
+  magnitudes/units in prose must appear in cited facts; Python also renders those
+  facts. These checks are not semantic verification; label model-generated text.
+  If reviewing/editing generated prose, retain the original as `model_draft` and
+  record the edits in `review`; keep the original request intact.
+- Model failures fail the run before replacing existing outputs. `--no-ai` is an
+  explicit MySQL-only mode and writes a disabled-status model evidence file.
+  `--print-sql` connects to neither service. `--demo` is unsupported everywhere.
+- All three artifacts carry one run ID and source evidence hash. Preserve the
+  exact model request, model digest, validated response, and usage for review;
+  do not save model thinking or raw service error bodies. Read timestamps do not
+  establish the underlying repayment observation date.
+- Paths resolve relative to `PROJECT_ROOT = Path(__file__).resolve().parent`.
+  Reruns replace report artifacts; select another output directory to retain runs.
+
+## Source data and importer safeguards
+
+Reporting uses MySQL only. `data/` remains the source for the separate importer
+and dictionary reference. It is a Windows directory junction to
+`C:\Users\kenny\Documents\lending-club-data`; writes through it change originals.
+Treat source data as read-only unless explicitly instructed otherwise. Use
+streaming or bounded reads of the large CSVs. Ignore Excel locks named `~$*`.
+
+Inputs:
 
 - `data/accepted_2007_to_2018Q4.csv.gz`
 - `data/rejected_2007_to_2018Q4.csv.gz`
@@ -49,84 +114,21 @@ Available inputs:
 - `data/rejected_2007_to_2018q4.csv/rejected_2007_to_2018Q4.csv`
 - `data/LCDataDictionary.xlsx`
 
-Treat source data as read-only unless the user explicitly requests changes.
-Writes through the junction change the original files. Save generated outputs
-in `outputs/` and new derived datasets in `processed/` inside this project.
-The existing sampler and tracked sample CSVs use `processed_samples/`; preserve
-that established location unless a task calls for changing it.
-Ignore temporary Excel lock files whose names begin with `~$`.
-The CSV files are large; use streaming, selected columns, or chunked reads.
+Use the dictionary under `data/` as authoritative; the tracked root workbook
+may be older. Recreate the ignored junction on another computer. Save generated
+outputs in `outputs/`, and any new derived data in `processed/`. Those folders,
+`processed_samples/`, `.venv/`, and Python bytecode are ignored by Git. Keep
+large source data and local environment files out of commits.
 
-The junction is local to this computer and excluded from Git. If the project
-is moved to another computer, recreate `data/` pointing to that computer's
-data folder.
+The importer preserves exact header names and source text in nullable utf8mb4
+LONGTEXT columns in InnoDB; empty CSV fields become SQL NULL. It validates both
+input headers and existing schemas before inserting and skips blank records and
+known accepted-loan funded-total footers. Malformed records fail validation.
 
-A tracked `LCDataDictionary.xlsx` also exists at the project root. Use the
-dictionary under `data/` as the source reference; do not assume the two copies
-remain synchronized.
-
-## Environment and checks
-
-Run commands from the project root in PowerShell. The existing `.venv` uses
-Python 3.13.7. `requirements.txt` pins `mysql-connector-python==26.7.0`, the
-project's only listed third-party dependency. Prefer the project interpreter:
-
-```powershell
-# Install dependencies when setting up or updating the environment.
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-# Offline regression tests; no MySQL server or credentials needed.
-.\.venv\Scripts\python.exe -m unittest test_import_csv_to_mysql -v
-
-# Read only the first 100 eligible rows per source without connecting to MySQL.
-.\.venv\Scripts\python.exe .\import_csv_to_mysql.py --dry-run --rows 100
-```
-
-If `.venv` is missing, create it with `python -m venv .venv` first. Tests create
-temporary fixtures under `outputs/` and clean them up. Use bounded dry runs for
-routine validation; a full scan or sample regeneration reads the large files.
-
-For an Ollama-specific task, run
-`.\.venv\Scripts\python.exe .\test_ollama.py` with Ollama running and the model
-installed. Its default generation timeout is 180 seconds and it keeps the model
-loaded for five minutes. This is a separate service check, not an offline unit
-test.
-
-## MySQL behavior to preserve
-
-- Connection defaults are `localhost:3306`, user `root`, database `demo`.
-  Passwords come from a prompt or `MYSQL_PASSWORD`; keep credentials out of
-  code, documentation, command-line arguments, and committed files.
-- The full importer preserves CSV header names and source text using nullable
-  `utf8mb4 LONGTEXT` columns in InnoDB tables. Empty CSV fields become SQL
-  `NULL`. Numeric and date analysis requires explicit conversion later.
-- Both input headers and existing destination schemas are checked before row
-  insertion. Blank records and known accepted-loan funded-total footers are
-  skipped; malformed records fail validation.
-- The full importer requires new or empty destination tables unless `--append`
-  is supplied. Append mode does not deduplicate or resume interrupted imports.
-  The preview script appends on every run.
-- The full importer commits batches independently (default maximum 1,000 rows,
-  also bounded by the server packet limit). Earlier committed batches survive
-  a later failure. A lost connection during commit can leave that batch's
-  outcome uncertain. Table creation is committed separately by MySQL.
-- Keep database values parameterized and identifiers quoted. Preserve the
-  importer's checks for compatible schemas and nonempty tables. It never drops
-  or truncates tables. A live import writes to MySQL; use `--dry-run` for CSV
-  validation when database writes are not part of the task.
-
-## Repository conventions and known documentation gap
-
-- Resolve input and output paths relative to the project root, following
-  `PROJECT_ROOT = Path(__file__).resolve().parent` in the existing scripts.
-- `data/`, `outputs/`, `.venv/`, and Python bytecode are ignored by Git.
-  `processed/` is ignored except for the two default sample filenames explicitly
-  allowed in `.gitignore`. The current tracked samples are in
-  `processed_samples/`.
-- The README sampling section and `sample_csv.py` module docstring still name
-  `processed/`, while the sampler's implementation writes `processed_samples/`.
-  Use the actual implementation and existing files when locating samples; keep
-  code, documentation, and ignore rules aligned when changing sample paths.
-- Keep large source data, generated outputs, and local environment files out of
-  commits. Keep checks appropriate to the change and report service-dependent
-  validation separately from offline tests.
+The importer requires new/empty tables unless `--append` is explicit. Append
+does not deduplicate or resume interrupted imports. It never drops or truncates
+tables. Batches (default up to 1,000 rows, also packet-bounded) commit independently;
+earlier commits survive later failures. A lost connection during commit can
+leave that batch uncertain. MySQL commits table creation separately. Keep
+values parameterized, identifiers quoted, and these checks intact. Use dry runs
+when database writes are outside the task.

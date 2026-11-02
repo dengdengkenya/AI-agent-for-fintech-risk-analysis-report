@@ -127,7 +127,7 @@ class ScoreCutoffToolTests(unittest.TestCase):
             "get_score_cutoff_aggregates", "compare_score_cutoffs",
         })
         self.assertEqual(set(catalog["tool_details"]), names)
-        runner = tool_api.ScoreCutoffTools(demo=True)
+        runner = tool_api.ScoreCutoffTools(connection_factory=lambda config: FakeConnection())
         for item in definitions:
             with self.subTest(tool=item["function"]["name"]):
                 self.assertEqual(item["type"], "function")
@@ -153,44 +153,43 @@ class ScoreCutoffToolTests(unittest.TestCase):
                 with self.subTest(tool=name, arguments=example["arguments"]):
                     connection = FakeConnection()
                     runner = tool_api.ScoreCutoffTools(
-                        demo=name != "inspect_sources", connection_factory=lambda config: connection,
+                        connection_factory=lambda config: connection,
                     )
                     self.assertEqual(example["name"], name)
                     response = runner.call_tool(example["name"], example["arguments"])
                     self.assertTrue(response["ok"], response)
 
-    def test_demo_comparison_matches_existing_report_calculations(self):
+    def test_database_comparison_matches_existing_report_calculations(self):
         request = {
             "cutoffs": [740, 600, 740], "baseline": 680, "min_outcomes": 1,
             "max_loss_rate": .08, "assume_comparable_scores": True,
             "rejected_loss_rate": .15, "take_up_rate": .25,
         }
-        factory = Mock(side_effect=AssertionError("Demo must not open a database"))
-        runner = tool_api.ScoreCutoffTools(demo=True, connection_factory=factory)
+        factory = Mock(return_value=FakeConnection())
+        runner = tool_api.ScoreCutoffTools(connection_factory=factory)
         response = runner.call_tool("compare_score_cutoffs", json.dumps(request))
         self.assertTrue(response["ok"], response)
         result = response["result"]
         expected_args = simulation.parse_args([
-            "--demo", "--cutoffs", "740,600,740", "--baseline", "680",
+            "--cutoffs", "740,600,740", "--baseline", "680",
             "--min-outcomes", "1", "--max-loss-rate", ".08",
             "--assume-comparable-scores", "--rejected-loss-rate", ".15",
             "--take-up-rate", ".25",
         ])
-        expected = simulation.analyze(simulation.demo_aggregates(expected_args), expected_args)
+        expected = simulation.analyze(fixture(), expected_args)
         self.assertEqual(result["results"], expected)
         self.assertEqual(result["settings"]["cutoffs"], [600, 680, 740])
-        self.assertEqual(result["mode"], "synthetic_demo")
+        self.assertEqual(result["mode"], "historical_mysql")
         self.assertTrue(result["limitations"])
         json.dumps(response, allow_nan=False)
-        factory.assert_not_called()
+        factory.assert_called_once_with(runner.config)
 
-    def test_demo_aggregates_are_disjoint_fixtures_not_cumulative_results(self):
-        runner = tool_api.ScoreCutoffTools(demo=True)
+    def test_database_aggregates_are_disjoint_fixtures_not_cumulative_results(self):
+        runner = tool_api.ScoreCutoffTools(connection_factory=lambda config: FakeConnection())
         result = runner.get_score_cutoff_aggregates(cutoffs=[600, 700], baseline=700)
-        args = simulation.parse_args(["--demo", "--cutoffs", "600,700", "--baseline", "700"])
-        self.assertEqual(result["aggregates"], simulation.demo_aggregates(args))
+        self.assertEqual(result["aggregates"], fixture())
         self.assertNotIn("results", result)
-        self.assertEqual(result["mode"], "synthetic_demo")
+        self.assertEqual(result["mode"], "historical_mysql")
 
     def test_query_preview_needs_no_database_and_preserves_parameters(self):
         factory = Mock(side_effect=AssertionError("Preview must not connect"))
@@ -256,20 +255,6 @@ class ScoreCutoffToolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.inspect_sources(sql="SELECT * FROM accepted")
         factory.assert_not_called()
-
-    def test_demo_does_not_claim_schema_or_filtered_months(self):
-        runner = tool_api.ScoreCutoffTools(demo=True)
-        for name, arguments in [
-            ("inspect_sources", {}),
-            ("get_score_cutoff_aggregates", {"start_month": "2015-01"}),
-            ("compare_score_cutoffs", {"end_month": "2015-12"}),
-        ]:
-            with self.subTest(tool=name):
-                response = runner.call_tool(name, arguments)
-                self.assertFalse(response["ok"])
-                self.assertEqual(response["error"]["code"], "invalid_arguments")
-        preview = runner.call_tool("preview_score_cutoff_queries", {"start_month": "2015-01"})
-        self.assertTrue(preview["ok"], preview)
 
     def test_live_comparison_uses_one_read_only_snapshot_and_closes_connection(self):
         connection = FakeConnection()
@@ -345,21 +330,20 @@ class ScoreCutoffToolTests(unittest.TestCase):
         self.assertTrue(all(cursor.closed for cursor in connection.cursors))
 
     def test_live_calls_require_local_credentials_without_prompting(self):
-        with patch.dict("os.environ", {}, clear=True), \
-             patch.object(simulation, "getpass", side_effect=AssertionError("No interactive prompt")):
+        with patch.dict("os.environ", {}, clear=True):
             response = tool_api.ScoreCutoffTools().call_tool("inspect_sources", {})
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"]["code"], "configuration_error")
 
     def test_cli_outputs_only_machine_readable_json(self):
         output = io.StringIO()
-        with redirect_stdout(output):
-            code = tool_api.main(["--demo", "--call", "compare_score_cutoffs"])
+        with redirect_stdout(output), patch.object(tool_api.ScoreCutoffTools, "_connect", return_value=FakeConnection()):
+            code = tool_api.main([ "--call", "compare_score_cutoffs"])
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(output.getvalue())["ok"])
         output = io.StringIO()
-        with redirect_stdout(output):
-            code = tool_api.main(["--demo", "--call", "compare_score_cutoffs",
+        with redirect_stdout(output), patch.object(tool_api.ScoreCutoffTools, "_connect", return_value=FakeConnection()):
+            code = tool_api.main([ "--call", "compare_score_cutoffs",
                                   "--arguments", '{"sql":"SELECT 1"}'])
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(output.getvalue())["error"]["code"], "invalid_arguments")

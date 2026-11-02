@@ -3,12 +3,11 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
-from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import patch
 
 import score_cutoff_simulation as simulation
+import generate_framework_report as bridge
 
 
 def accepted(bucket, rows, amount_rows, amount, terminal=0, bad=0,
@@ -159,7 +158,7 @@ class ScoreCutoffSimulationTests(unittest.TestCase):
         args = simulation.parse_args(["--cutoffs", "740,600,740", "--baseline", "680"])
         self.assertEqual(args.cutoffs, [600, 680, 740])
         self.assertEqual([row["cutoff"] for row in simulation.analyze(
-            simulation.demo_aggregates(args), args)["scenarios"]], [600, 680, 740])
+            fixture(), args)["scenarios"]], [600, 680, 740])
 
     def test_invalid_arguments_fail_before_connecting(self):
         invalid = [
@@ -227,33 +226,10 @@ class ScoreCutoffSimulationTests(unittest.TestCase):
         self.assertEqual(connection.rollbacks, 1)
         self.assertTrue(connection.fake_cursor.closed)
 
-    def test_demo_writes_labeled_report_without_credentials_or_mysql(self):
-        output_root = simulation.PROJECT_ROOT / "outputs"
-        output_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix="cutoff-test-", dir=output_root) as temp:
-            folder = Path(temp).resolve()
-            self.assertTrue(folder.is_relative_to(output_root.resolve()))
-            with patch.dict("os.environ", {"MYSQL_PASSWORD": "do-not-export-this"}), \
-                 patch.object(simulation, "getpass", side_effect=AssertionError("Unexpected password prompt")), \
-                 patch.object(simulation, "fetch_aggregates", side_effect=AssertionError("Unexpected MySQL read")), \
-                 redirect_stdout(io.StringIO()):
-                simulation.main(["--demo", "--output-dir", str(folder)])
-            report = (folder / "report.md").read_text(encoding="utf-8")
-            evidence_text = (folder / "aggregates.json").read_text(encoding="utf-8")
-            evidence = json.loads(evidence_text)
-            self.assertIn("SYNTHETIC DEMO", report)
-            self.assertIn("not MySQL results", report)
-            self.assertIn("growth versus principal losses", report)
-            self.assertNotIn("do-not-export-this", report + evidence_text)
-            self.assertTrue(evidence["settings"]["demo"])
-            self.assertEqual(evidence["queries"], {})
-            self.assertEqual(len(evidence["results"]["scenarios"]), 7)
-            self.assertIsNone(evidence["results"]["candidate_cutoff"])
-
     def test_print_sql_needs_no_credentials_or_output_files(self):
         output = io.StringIO()
         with redirect_stdout(output), \
-             patch.object(simulation, "getpass", side_effect=AssertionError("Unexpected prompt")), \
+             patch.object(bridge, "getpass", side_effect=AssertionError("Unexpected prompt")), \
              patch.object(simulation, "fetch_aggregates", side_effect=AssertionError("Unexpected MySQL read")):
             simulation.main(["--print-sql"])
         queries = json.loads(output.getvalue())

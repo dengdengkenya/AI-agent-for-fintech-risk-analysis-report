@@ -1,22 +1,15 @@
-"""Compare score cutoffs using only MySQL aggregates; write a local demo report.
+"""Compare score cutoffs using MySQL aggregates and local Qwen interpretation.
 
 Run: .venv/Scripts/python.exe score_cutoff_simulation.py
-Offline example: .venv/Scripts/python.exe score_cutoff_simulation.py --demo
 Requires MySQL 8.0+ and the existing mysql-connector-python dependency.
 """
 
 import argparse
-from contextlib import closing
 from datetime import datetime, timezone
-from decimal import Decimal
-from getpass import getpass
-import json
 import math
-import os
 from pathlib import Path
 import re
 import sys
-from time import perf_counter
 
 from import_csv_to_mysql import quote_identifier
 
@@ -49,7 +42,7 @@ def fraction(value):
     return number
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, *, configure_parser=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=3306)
@@ -76,10 +69,10 @@ def parse_args(argv=None):
     parser.add_argument("--query-timeout", type=int, default=600,
                         help="Maximum seconds per aggregate SELECT; default 600")
     parser.add_argument("--output-dir", type=project_path, default=PROJECT_ROOT / "outputs" / "score_cutoff")
-    parser.add_argument("--demo", action="store_true",
-                        help="Use artificial aggregate fixtures, never real loan data")
     parser.add_argument("--print-sql", action="store_true",
                         help="Print aggregate SQL and parameters without connecting")
+    if configure_parser is not None:
+        configure_parser(parser)
     args = parser.parse_args(argv)
     try:
         args.cutoffs = sorted({int(x.strip()) for x in args.cutoffs.split(",")} | {args.baseline})
@@ -97,8 +90,6 @@ def parse_args(argv=None):
         parser.error("Use --assume-comparable-scores and --rejected-loss-rate together")
     if args.take_up_rate != 1 and not args.assume_comparable_scores:
         parser.error("--take-up-rate requires the explicit rejected lending assumptions")
-    if args.demo and (args.start_month or args.end_month):
-        parser.error("Demo fixtures have no monthly detail; omit date filters or use MySQL")
     try:
         for name in (args.database, args.accepted_table, args.rejected_table):
             quote_identifier(name)
@@ -181,37 +172,9 @@ FROM classified GROUP BY scope, bucket ORDER BY scope, bucket"""
 
 
 def fetch_aggregates(connection, args):
-    # Server-enforced read-only repeatable snapshot across both InnoDB tables.
-    connection.start_transaction(isolation_level="REPEATABLE READ", readonly=True,
-                                 consistent_snapshot=True)
-    try:
-        with closing(connection.cursor(dictionary=True)) as cursor:
-            for kind in ("accepted", "rejected"):
-                table = getattr(args, f"{kind}_table")
-                cursor.execute("SELECT ENGINE FROM information_schema.TABLES "
-                               "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s", (args.database, table))
-                metadata = cursor.fetchone()
-                if not metadata or metadata["ENGINE"] != "InnoDB":
-                    raise ValueError(f"{kind}: expected an existing InnoDB table")
-                cursor.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                               "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s", (args.database, table))
-                missing = REQUIRED[kind] - {row["COLUMN_NAME"] for row in cursor.fetchall()}
-                if missing:
-                    raise ValueError(f"{kind}: missing required columns: {', '.join(sorted(missing))}")
-            result = {}
-            for kind in ("accepted", "rejected"):
-                print(f"Aggregating {kind} in MySQL (large tables can take several minutes)...", flush=True)
-                sql, params = build_query(kind, args)
-                cursor.execute(sql, params)
-                result[kind] = [
-                    {key: (int(value) if key.endswith("rows") else float(value)) if isinstance(value, Decimal) else value
-                     for key, value in row.items()} for row in cursor.fetchall()
-                ]
-                if not result[kind]:
-                    raise ValueError(f"{kind} table is empty; import data before running the report")
-            return result
-    finally:
-        connection.rollback()
+    """Compatibility entry point for the shared read-only SQL implementation."""
+    from score_cutoff_sql import fetch_aggregates as fetch
+    return fetch(connection, args)
 
 
 def total(rows):
@@ -278,32 +241,6 @@ def analyze(aggregates, args):
             "candidate_cutoff": candidate["cutoff"] if candidate else None}
 
 
-def demo_aggregates(args):
-    """Artificial band totals, independent of source data, for a repeatable walkthrough."""
-    result = {"accepted": [], "rejected": []}
-    # Assign synthetic score-band populations to the requested thresholds.
-    for score, count, bad, loss_rate in ((610, 800, 200, .18), (650, 1400, 252, .12),
-                                        (670, 2200, 286, .085), (690, 2600, 260, .06),
-                                        (710, 2300, 161, .04), (730, 1700, 85, .025),
-                                        (770, 1000, 30, .012)):
-        bucket = max((cutoff for cutoff in args.cutoffs if cutoff <= score), default=0)
-        terminal = int(count * .8)
-        result["accepted"].append({
-            "scope": "in_scope", "bucket": bucket, "rows": count, "amount_rows": count,
-            "amount_sum": count * 12000, "terminal_rows": terminal, "charged_off_rows": bad,
-            "performance_rows": terminal, "performance_principal": terminal * 12000,
-            "loss_amount": terminal * 12000 * loss_rate,
-        })
-        rejected = max(100, 9000 - (score - 600) * 45)
-        result["rejected"].append({"scope": "in_scope", "bucket": bucket,
-                                   "rows": rejected, "amount_rows": rejected,
-                                   "amount_sum": rejected * 10000})
-    for kind in result:
-        result[kind].append({"scope": "in_scope", "bucket": -1,
-                             "rows": 300, "amount_rows": 300, "amount_sum": 3000000})
-    return result
-
-
 def pct(value):
     return "N/A" if value is None else f"{value:.2%}"
 
@@ -315,7 +252,7 @@ def usd(value):
 def render_report(result, args):
     rows = result["scenarios"]
     baseline = next(row for row in rows if row["cutoff"] == args.baseline)
-    mode = "SYNTHETIC DEMO — not MySQL results" if args.demo else "Historical MySQL aggregate analysis"
+    mode = "Historical MySQL aggregate analysis"
     lines = ["# Score cutoff simulation: growth versus principal losses", "", f"**{mode}**", "",
              f"Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')} (UTC).",
              f"Cohort months: {args.start_month or 'earliest available'} through {args.end_month or 'latest available'}; "
@@ -381,9 +318,8 @@ def render_report(result, args):
                   "they are not added into a purported portfolio loss forecast. Expansion includes all screened rejects "
                   "at each cutoff, including at the baseline cutoff; it is not solely the effect of lowering a threshold."]
     else:
-        lines += ["", "No rejected loan growth or loss forecast is made. To illustrate one explicitly, rerun with "
-                  "`--assume-comparable-scores --rejected-loss-rate 0.15 --take-up-rate 0.25`. "
-                  "Those numbers are example assumptions, not measured estimates."]
+        lines += ["", "No rejected loan growth or loss forecast is made because rejected applications "
+                  "have no observed repayment outcomes."]
     lines += ["", "## Coverage and exclusions", "",
               "| Source | Table rows | In cohort | Invalid date | Outside cohort | Invalid score in cohort | Invalid amount in cohort |",
               "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
@@ -421,7 +357,7 @@ def render_report(result, args):
               "amount, and nonnegative recoveries. Missing or malformed values are excluded, never silently made zero. "
               "Counts can therefore include loans excluded from dollar totals. Monetary text accepts up to four decimal places.",
               f"- Rates are N/A below {args.min_outcomes} relevant outcomes or with zero denominator. "
-              "The minimum is a demo stability check, not a statistical guarantee or privacy threshold. "
+              "The minimum is a reporting threshold, not a statistical guarantee or privacy threshold. "
               "The optional historical candidate also requires 100% terminal financial coverage.",
               "- Dates filter issue/application cohorts, not repayment observation dates. The CSV performance snapshot "
               "does not establish performance as of the execution date. Different calendar coverage, seasoning, "
@@ -429,10 +365,10 @@ def render_report(result, args):
               "or deduplication is certified by this report.",
               "- MySQL is read in a consistent, read-only transaction. Only grouped counts, sums and month bounds "
               "reach Python; no borrower rows, names, IDs, descriptions or contact data are exported. "
-              "No AI service or external reporting service receives data. Aggregates can still reveal small groups; "
-              "this demo does not provide anonymization or differential privacy.", "",
+              "When enabled, local Ollama receives only calculated aggregate facts for interpretation. "
+              "Aggregates can still reveal small groups; this report does not provide anonymization or differential privacy.", "",
               "## Reproducibility", "",
-              f"Source: {'artificial aggregate fixtures' if args.demo else args.database + '.' + args.accepted_table + ' and ' + args.database + '.' + args.rejected_table}.",
+              f"Source: {args.database}.{args.accepted_table} and {args.database}.{args.rejected_table}.",
               "`aggregates.json` retains the aggregate inputs, scenario calculations, parameters and executed query templates "
               "beside this report. The source dictionary is `data/LCDataDictionary.xlsx`. "
               "Use `--print-sql` to inspect queries without connecting.", ""]
@@ -440,62 +376,11 @@ def render_report(result, args):
 
 
 def main(argv=None):
-    args = parse_args(argv)
-    queries = {kind: dict(zip(("sql", "params"), build_query(kind, args))) for kind in REQUIRED}
-    if args.print_sql:
-        print(json.dumps(queries, indent=2))
-        return
-    started = perf_counter()
-    connection = None
-    try:
-        if args.demo:
-            aggregates = demo_aggregates(args)
-        else:
-            try:
-                import mysql.connector
-            except ImportError as error:
-                raise RuntimeError("Install the project requirements before connecting to MySQL") from error
-            password = os.environ.get("MYSQL_PASSWORD")
-            if password is None:
-                if not sys.stdin.isatty():
-                    raise RuntimeError("Set MYSQL_PASSWORD locally or run in an interactive terminal for the password prompt; "
-                                       "use --demo for synthetic data")
-                password = getpass(f"MySQL password for {args.user}@{args.host}: ")
-            connection = mysql.connector.connect(
-                host=args.host, port=args.port, user=args.user, password=password,
-                charset="utf8mb4", connection_timeout=10, autocommit=True, sql_mode="TRADITIONAL",
-            )
-            with closing(connection.cursor()) as cursor:
-                cursor.execute("SET SESSION MAX_EXECUTION_TIME = %s", (args.query_timeout * 1000,))
-            aggregates = fetch_aggregates(connection, args)
-        result = analyze(aggregates, args)
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        report_path = args.output_dir / "report.md"
-        report_path.write_text(render_report(result, args), encoding="utf-8")
-        # Explicit allowlist: never serialize credentials, connection objects or arbitrary source rows.
-        settings = {key: getattr(args, key) for key in (
-            "database", "accepted_table", "rejected_table", "cutoffs", "baseline", "start_month", "end_month",
-            "max_loss_rate", "min_outcomes", "assume_comparable_scores", "rejected_loss_rate", "take_up_rate", "demo")}
-        payload = {"generated_at_utc": datetime.now(timezone.utc).isoformat(), "settings": settings,
-                   "aggregates": aggregates, "results": result,
-                   "queries": queries if not args.demo else {}, "elapsed_seconds": perf_counter() - started}
-        (args.output_dir / "aggregates.json").write_text(json.dumps(payload, indent=2, allow_nan=False), encoding="utf-8")
-        print(f"{'SYNTHETIC DEMO' if args.demo else 'MySQL aggregate'} report: {report_path}")
-        print(f"Completed in {perf_counter() - started:.1f}s. Existing files in this output directory are replaced.")
-    except KeyboardInterrupt:
-        raise SystemExit("Simulation interrupted; no database data was changed")
-    except Exception as error:
-        # Connector error text may quote invalid source values. Keep failures aggregate-only too.
-        if type(error).__module__.startswith("mysql"):
-            detail = f"MySQL error {getattr(error, 'errno', 'unknown')}; check access, schema and query timeout"
-        else:
-            detail = str(error)
-        print(f"Simulation failed: {detail}", file=sys.stderr)
-        raise SystemExit(1) from None
-    finally:
-        if connection is not None:
-            connection.close()
+    """Use the same MySQL/Qwen pipeline from either report entry point."""
+    from generate_framework_report import main as generate
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    return generate(["--output-dir", str(PROJECT_ROOT / "outputs" / "score_cutoff"), *arguments])
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

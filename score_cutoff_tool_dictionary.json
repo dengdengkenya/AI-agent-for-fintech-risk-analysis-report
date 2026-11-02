@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "purpose": "Read-only Lending Club score-cutoff analysis. Choose named Python functions to satisfy a user's goal; do not generate executable SQL or perform the financial arithmetic yourself.",
   "runtime": {
     "module": "score_cutoff_tools",
@@ -8,7 +8,6 @@
     "tool_definitions": "get_tool_definitions() returns the tools array for an Ollama chat request.",
     "execution": "The LLM produces a function name and JSON arguments. The Python host validates and executes the call, then supplies the JSON response to the LLM. This catalog does not itself run an agent or contact Ollama.",
     "configuration": "The host supplies DatabaseConfig and MYSQL_PASSWORD, or a trusted connection_factory. Never request or include credentials, hostnames, table names, SQL text or file paths as tool arguments.",
-    "demo": "The host can set demo=true for artificial fixtures. No database connection is made; monthly filters and schema inspection are unavailable. Query preview still supports date filters.",
     "side_effects": "Live operations open and close a connection and read metadata or grouped data in a read-only transaction, rolled back on completion. No database writes, report files or LLM network requests occur. Preview makes no database connection.",
     "success": {"ok": true, "result": "Tool-specific JSON object described in tool_details."},
     "failure": {"ok": false, "error": {"code": "unknown_tool | invalid_arguments | configuration_error | database_error | execution_error", "message": "Actionable validation message or sanitized execution failure."}},
@@ -22,7 +21,7 @@
     {"goal": "Illustrate lending to rejected applicants", "tool": "compare_score_cutoffs", "guidance": "Only use assume_comparable_scores=true with an explicitly supplied rejected_loss_rate. Take-up and score comparability are assumptions, not inferred facts. Ask for missing assumptions before enabling expansion."}
   ],
   "interpretation_rules": [
-    "Always preserve mode: synthetic_demo is artificial, historical_mysql is historical database evidence, and query_preview contains no results.",
+    "Always preserve mode: historical_mysql is historical database evidence, and query_preview contains no results.",
     "Accepted score is the midpoint of original integer FICO endpoints in 300-850. Cutoffs are inclusive. Baseline 660 is an illustrative default, not a verified policy.",
     "Rejected Risk_Score mixes score systems over time and is not generally comparable to accepted FICO, even when numerically in 300-850. Rejected rows have no repayment outcomes.",
     "Growth is the change in retained historical accepted loans versus baseline, not a forecast or an approval rate. Application rows are not deduplicated people.",
@@ -63,14 +62,14 @@
       "type": "function",
       "function": {
         "name": "get_score_cutoff_aggregates",
-        "description": "Read both configured source tables in one consistent read-only snapshot and return disjoint score-band counts, sums and month bounds. Use for inspecting aggregate evidence; prefer compare_score_cutoffs for calculated comparisons. Each live call scans both large tables and can take minutes. Synthetic mode uses labeled fixtures and cannot filter months.",
+        "description": "Read both configured source tables in one consistent read-only snapshot and return disjoint score-band counts, sums and month bounds. Use for inspecting aggregate evidence; prefer compare_score_cutoffs for calculated comparisons. Each live call scans both large tables and can take minutes.",
         "parameters": {
           "type": "object", "additionalProperties": false, "required": [],
           "properties": {
             "cutoffs": {"type": "array", "items": {"type": "integer", "minimum": 300, "maximum": 850}, "minItems": 1, "maxItems": 30, "default": [600, 640, 660, 680, 700, 720, 740], "description": "Inclusive minimum scores. Sorted and deduplicated; at most 30 distinct thresholds including baseline."},
             "baseline": {"type": "integer", "minimum": 300, "maximum": 850, "default": 660, "description": "Comparison threshold included in the band boundaries; not a verified current policy."},
-            "start_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort start, or null. Unavailable for synthetic fixtures."},
-            "end_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort end, or null; must not precede start_month. Unavailable for synthetic fixtures."}
+            "start_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort start, or null."},
+            "end_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort end, or null; must not precede start_month."}
           }
         }
       }
@@ -85,10 +84,10 @@
           "properties": {
             "cutoffs": {"type": "array", "items": {"type": "integer", "minimum": 300, "maximum": 850}, "minItems": 1, "maxItems": 30, "default": [600, 640, 660, 680, 700, 720, 740], "description": "Inclusive minimum scores to compare. Sorted and deduplicated; baseline added. At most 30 distinct thresholds including baseline."},
             "baseline": {"type": "integer", "minimum": 300, "maximum": 850, "default": 660, "description": "Comparison threshold, not verified current policy."},
-            "start_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort start, or null. Unavailable for synthetic fixtures."},
-            "end_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort end, or null; must not precede start_month. Unavailable for synthetic fixtures."},
+            "start_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort start, or null."},
+            "end_month": {"type": ["string", "null"], "pattern": "^[12][0-9]{3}-(0[1-9]|1[0-2])$", "maxLength": 7, "default": null, "description": "Inclusive YYYY-MM cohort end, or null; must not precede start_month."},
             "max_loss_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1, "default": null, "description": "User-supplied historical accepted-loss ceiling as a fraction; 0.08 means 8%. Null means do not select a candidate. Does not constrain hypothetical expansion losses."},
-            "min_outcomes": {"type": "integer", "minimum": 1, "default": 100, "description": "Minimum relevant terminal outcomes to display a rate. A demo stability check, not a statistical guarantee."},
+            "min_outcomes": {"type": "integer", "minimum": 1, "default": 100, "description": "Minimum relevant terminal outcomes to display a rate. A reporting threshold, not a statistical guarantee."},
             "assume_comparable_scores": {"type": "boolean", "default": false, "description": "Enable hypothetical rejected lending only when the user explicitly assumes rejected scores match accepted FICO. Requires rejected_loss_rate."},
             "rejected_loss_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1, "default": null, "description": "Explicit assumed lifetime principal-loss fraction on new rejected lending. Requires assume_comparable_scores=true. Never infer from rejected outcomes, which do not exist."},
             "take_up_rate": {"type": "number", "minimum": 0, "maximum": 1, "default": 1.0, "description": "Assumed fraction of screened rejected demand with valid amounts funded in full. Values other than 1 require explicit rejected-lending assumptions."}
@@ -121,12 +120,12 @@
     }
   },
   "aggregate_fields": {
-    "scope": "in_scope, outside_period or invalid_date. Synthetic bands have only in_scope.",
+    "scope": "in_scope, outside_period or invalid_date.",
     "bucket": "Highest tested threshold met; 0 means valid score below all thresholds; -1 means invalid/missing score. These are mutually exclusive bands.",
     "rows": "Number of source rows in the band, including invalid amounts.",
     "amount_rows": "Rows with a valid positive funded/requested amount.",
     "amount_sum": "Sum of valid positive funded amount for accepted or requested amount for rejected, in USD.",
-    "first_month / last_month": "Minimum/maximum parsed cohort month; may be null. Absent from synthetic fixtures.",
+    "first_month / last_month": "Minimum/maximum parsed cohort month; may be null.",
     "terminal_rows": "Accepted only: Fully Paid or Charged Off count.",
     "charged_off_rows": "Accepted only: Charged Off count.",
     "performance_rows": "Accepted only: terminal rows with complete valid financial fields.",
@@ -151,6 +150,6 @@
     "total_rows": "All source rows, including off-cohort rows.",
     "in_scope_rows / invalid_date_rows / outside_period_rows": "Mutually exclusive date classifications that sum to total_rows.",
     "invalid_score_rows / invalid_amount_rows": "Invalid field counts within the cohort; may overlap, so do not add them as distinct exclusions.",
-    "first_month / last_month": "Observed in-scope bounds or null; synthetic fixtures have no month bounds."
+    "first_month / last_month": "Observed in-scope bounds or null."
   }
 }
