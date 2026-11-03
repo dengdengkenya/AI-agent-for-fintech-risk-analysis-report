@@ -1,0 +1,38 @@
+# Team defaults for python -m loan_analyst. Copy to loan_analyst.toml (loaded automatically)
+# or pass --config FILE. Command-line flags always override these values.
+# Passwords are never read from files: use MYSQL_PASSWORD or the terminal prompt.
+
+[database]
+host = "localhost"
+port = 3306
+user = "root"
+database = "demo"
+accepted_table = "accepted"
+rejected_table = "rejected"
+query_timeout = 600
+
+[scenario]
+cutoffs = [600, 640, 660, 680, 700, 720, 740]
+baseline = 660
+min_outcomes = 100
+# start_month = "2012-01"
+# end_month = "2015-12"
+# max_loss_rate = 0.08
+# Explicit hypothetical expansion assumptions; the analyst can never set these itself:
+# assume_comparable_scores = true
+# rejected_loss_rate = 0.15
+# take_up_rate = 0.25
+
+[model]
+url = "http://localhost:11434"
+model = "qwen3:4b"
+timeout = 300
+max_tool_rounds = 4
+max_tool_calls = 8
+
+[report]
+output_dir = "outputs/framework_report"
+# Reorder or drop sections; see `python -m loan_analyst report --help` for names.
+sections = ["summary", "analyst", "at_a_glance", "cutoffs", "score_bands", "vintages", "segments",
+            "rejected", "coverage", "next_decision", "investigation", "evidence", "definitions",
+            "reproducibility"]

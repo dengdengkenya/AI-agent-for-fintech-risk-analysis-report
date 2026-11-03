@@ -1,94 +1,143 @@
-# MySQL loan reports with local Qwen analysis
+# MySQL loan reports with a local tool-calling analyst
 
 Generate reports from the existing MySQL tables `demo.accepted` and
-`demo.rejected`. The schema is named `demo`, but these are the real imported
-loan tables. Reporting has no synthetic mode, sample-file input, CSV fallback,
-or preview-table workflow.
+`demo.rejected`, and ask questions about them in plain English. The schema is
+named `demo`, but these are the real imported loan tables. Reporting has no
+synthetic mode, sample-file input or CSV fallback.
 
-## Generate a report
+A local Qwen model (via Ollama) acts as the analyst. It does more than describe a
+finished table: it chooses analysis tools, such as another cohort, a score-band
+breakdown, vintages, grades or a loss-ceiling sweep, runs them, and writes
+findings. Every statement cites the facts it relies on, and Python checks the
+statements before anything is shown.
+
+## Quick start
 
 Run from this project in PowerShell. MySQL 8.0+ and local Ollama must be running.
-The default model is the installed `qwen3:4b`.
 
 ```powershell
 # First-time setup only, if the environment is missing:
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-# Install the model only if it is not already installed:
 ollama pull qwen3:4b
 
-# Generate a report; enter the MySQL password at the local terminal prompt:
-.\.venv\Scripts\python.exe .\generate_framework_report.py
+# Full report; enter the MySQL password at the prompt (or set MYSQL_PASSWORD):
+.\.venv\Scripts\python.exe -m loan_analyst report
 ```
 
-Connection defaults: `localhost:3306`, user `root`, database `demo`, tables
-`accepted` and `rejected`. Override these with `--host`, `--port`, `--user`,
-`--database` (or `--schema`), `--accepted-table`, and `--rejected-table`.
-Unattended runs read `MYSQL_PASSWORD` from the local process environment.
-Never put passwords in command-line arguments, source code, or committed files.
-A SELECT-only account is sufficient for reporting.
+The first run reads both tables once (this can take minutes) and saves that
+read as a snapshot. After that, everything can reuse the snapshot and finish in
+seconds plus model time:
 
-The default folder is `outputs/framework_report/`, containing:
+```powershell
+.\.venv\Scripts\python.exe -m loan_analyst ask "Which cutoff keeps losses under 8% for 2012-2015 loans?" --snapshot latest
+.\.venv\Scripts\python.exe -m loan_analyst chat --snapshot latest
+```
+
+## Everyday commands
+
+All commands are `python -m loan_analyst <command>`; each has `--help`.
+
+| Command | What it does |
+| --- | --- |
+| `report` | Reads MySQL once, runs every analysis, lets the analyst investigate, writes the report folder. |
+| `report --snapshot latest` | Same, from the newest saved snapshot; MySQL is not queried. |
+| `ask "QUESTION"` | Answers one question; prints the answer with numbered evidence and saves a transcript. |
+| `chat` | Interactive session over one snapshot; follow-up questions keep context. `/tools`, `/help`, `/quit`. |
+| `render DIR` | Re-renders `report.md` after a human review of the wording (see below). |
+| `tools`, `call NAME '{json}'` | Prints the tool catalog, or runs one tool and prints its facts as JSON. |
+| `sql` | Prints the exact snapshot SQL without connecting. |
+| `snapshot` | Reads MySQL and saves a snapshot without running a model. |
+
+Previous commands still map cleanly:
+
+| Before | Now |
+| --- | --- |
+| `generate_framework_report.py [options]` | Unchanged; it runs `report [options]`. |
+| `score_cutoff_simulation.py` | `report --output-dir outputs/score_cutoff` |
+| `score_cutoff_tools.py --list-tools` | `tools` |
+| `score_cutoff_tools.py --call NAME --arguments JSON` | `call NAME JSON` |
+| `--print-sql` | `sql` (or `report --print-sql`) |
+
+Connection defaults: `localhost:3306`, user `root`, database `demo`, tables
+`accepted` and `rejected`. Override with `--host`, `--port`, `--user`,
+`--database` (or `--schema`), `--accepted-table` and `--rejected-table`.
+Passwords come only from `MYSQL_PASSWORD` or the terminal prompt. A SELECT-only
+account is sufficient. Scenario options are unchanged: `--cutoffs`, `--baseline`,
+`--start-month`, `--end-month`, `--max-loss-rate`, `--min-outcomes`, and the
+explicit expansion assumptions `--assume-comparable-scores`,
+`--rejected-loss-rate` and `--take-up-rate`.
+
+## How the analyst works
+
+1. **One snapshot.** Each table is scanned once in a read-only transaction and
+   grouped by cohort month, score and (when present) grade and term. Only those
+   counts and sums leave MySQL. The snapshot is saved to `outputs/snapshots/`.
+2. **Report steps.** Python runs the standard analyses over the snapshot: data
+   coverage, cutoff comparison, score bands, issue years, grade, term and
+   rejected score eras. Each produces tables plus plain-sentence facts.
+3. **Investigation.** The model sees the key facts and may call tools for up to
+   4 rounds and 8 calls (`--max-tool-rounds`, `--max-tool-calls`). Tools compute
+   in memory, so the model never triggers another database scan.
+4. **Evidence-checked answer.** The model returns a headline, findings, caveats
+   and next steps, each citing fact IDs. Python checks that every number is
+   copied from the cited facts and that no statement calls a cutoff an
+   approval or rejection. Failing statements get one repair attempt; any that
+   still fail are withheld and listed. If the headline cannot be validated, the
+   run fails and earlier report files are left untouched.
+
+| Tool | Purpose |
+| --- | --- |
+| `describe_data` | Tables, row counts, month ranges, available segments, cohort exclusions. |
+| `compare_score_cutoffs` | Retained loans, principal, charge-offs and loss proxy per cutoff, with an optional loss ceiling. |
+| `segment_performance` | Disjoint breakdown by score band (what each cutoff step removes), issue year (seasoning), grade or term. |
+| `sweep_loss_ceilings` | How the screening candidate moves across several loss ceilings. |
+| `rejected_applications` | Rejected numeric screens by score era (FICO before 2013-11, VantageScore after) or application year. |
+
+The model sees fact sentences only. It never sees borrower records, SQL,
+credentials or connection settings, and it cannot set the expansion
+assumptions. The endpoint must be loopback HTTP; proxies, redirects and cloud
+models are blocked. `--max-tool-rounds 0` limits the model to interpreting the
+standard facts. `--num-ctx` (default 16384 tokens) leaves room for tool rounds;
+lower it on machines with little memory, together with fewer tool calls.
+
+## Outputs
+
+A report folder (default `outputs/framework_report/`; change with
+`--output-dir`) contains:
 
 | File | Contents |
 | --- | --- |
-| `report.md` | Numerical comparisons, coverage, definitions, and local Qwen interpretation with evidence references. |
-| `aggregates.json` | The actual MySQL aggregate snapshot, deterministic calculations, settings, executed SQL templates and parameters, read times, run ID, and evidence hash. |
-| `ollama_analysis.json` | Exact aggregate-only model request, cited facts, validated analysis, model digest, timing, token counts, and matching run ID and evidence hash. |
+| `report.md` | Summary, analyst findings with numbered citations, calculated tables, the investigation steps, cited evidence and definitions. |
+| `aggregates.json` | Settings, snapshot provenance, every report-step result and fact, run ID and source evidence hash. |
+| `snapshot.json` | The grouped MySQL aggregates and SQL behind this run; reuse with `--snapshot <folder>/snapshot.json`. |
+| `ollama_analysis.json` | Exact model requests, tool definitions, tool calls and results, the validated answer, withheld statements, model digest and usage (or a disabled status). |
 
-Reruns replace these three files. Use `--output-dir` to keep separate runs.
-Relative paths resolve from the project root. Both tables are validated and read
-in one consistent, read-only transaction, which ends before model generation.
-Each table is scanned once; large text tables can take several minutes. The
-server-side query limit defaults to 600 seconds per SELECT (`--query-timeout`).
-Neither reports nor models modify the database.
+Reruns replace these four files. `ask` and `chat` save Markdown and JSON
+transcripts under `outputs/ask/` and `outputs/chat/`. `--no-ai` explicitly
+writes the calculated report without model commentary. `--sections` chooses
+and orders report sections.
+
+## Team defaults
+
+Copy `loan_analyst.example.toml` to `loan_analyst.toml` to set shared defaults
+(tables, cutoffs, cohort, loss ceiling, model, report sections) without long
+command lines. It loads automatically; `--config FILE` selects another file, and
+command-line flags always win. Config files may not contain passwords.
+
+## Reviewing the wording
+
+Model text is labeled for review. To correct it, edit `answer` in
+`ollama_analysis.json`, leave `model_draft` as generated, add a `review` entry
+describing the change, then run:
 
 ```powershell
-# Choose a historical cohort and comparisons:
-.\.venv\Scripts\python.exe .\generate_framework_report.py `
-  --cutoffs 600,640,660,680,700,720,740 --baseline 660 `
-  --start-month 2012-01 --end-month 2015-12 `
-  --output-dir outputs/cohort_report
-
-# Inspect SQL without connecting to MySQL or Ollama, or creating output:
-.\.venv\Scripts\python.exe .\generate_framework_report.py --print-sql
-
-# Explicitly omit model commentary, while still using the real MySQL tables:
-.\.venv\Scripts\python.exe .\generate_framework_report.py --no-ai
+.\.venv\Scripts\python.exe -m loan_analyst render outputs/framework_report
 ```
 
-`score_cutoff_simulation.py` remains a compatibility entry point for the same
-MySQL/Qwen pipeline, with its existing `outputs/score_cutoff/` default folder.
-The old `--demo` flag is rejected by every reporting entry point.
-
-## What Qwen does
-
-The runner checks the installed local model before scanning MySQL. After Python
-calculates the results, Qwen writes interpretations of volume/loss tradeoffs,
-coverage limitations, and useful next analytical steps. It sees only a bounded
-set of aggregate facts and metric definitions. It receives no credentials,
-connection settings, borrower records, or SQL execution tools. It cannot change
-queries, calculations, or the selected historical cutoff.
-
-The client uses Ollama's [chat API](https://docs.ollama.com/api/chat) with
-[structured JSON output](https://docs.ollama.com/capabilities/structured-outputs),
-`think: false`, and temperature zero. The endpoint must be loopback HTTP;
-HTTP proxies, redirects, and cloud model tags are blocked. Exact numerical facts
-are rendered by Python beside the model's evidence references. Numeric magnitudes
-and units quoted by the model must appear in its cited facts. These checks do not prove that
-the model's interpretation is correct, so commentary is labeled for review.
-If wording is edited during review, retain the original response as `model_draft`
-and record the corrections in `review` inside the model evidence file.
-
-Options: `--ollama-url http://localhost:11434`, `--ollama-model qwen3:4b`, and
-`--ollama-timeout 300` (seconds per generation request). One validation retry is
-allowed without querying MySQL again. A missing model, timeout, malformed output,
-unknown reference, or incomplete response fails the run without replacing the
-previous report. There is no silent model-free or synthetic fallback. `--no-ai`
-is the explicit way to disable commentary; its evidence file records that status.
-The model stays loaded for five minutes after generation. No new Python package
-is required for the Ollama integration.
+Rendering refuses edits that are not recorded in `review` and re-runs the
+evidence checks, so reviewed text cannot quote numbers that are absent from its
+cited facts.
 
 ## Reading the results
 
@@ -98,15 +147,19 @@ accepted loans. Performance uses only exactly `Fully Paid` and `Charged Off`.
 The principal-loss proxy is unrecovered principal on financially complete
 charged-off loans divided by funded principal of all financially complete
 terminal loans. Fully paid loans contribute zero loss; open loans do not enter
-the loss denominator. Costs, interest, fees, and timing are excluded. This is
+the loss denominator. Costs, interest, fees and timing are excluded. This is
 historical cohort analysis, not an annualized loss measure or a forecast.
 
-Malformed numeric text is excluded before casting. Missing financial values
-are not zero. Rates require at least 100 relevant outcomes by default
+Score bands hold only the loans between adjacent cutoffs, so they show what each
+step up in the cutoff removes. Issue-year tables show seasoning: years with a
+low terminal share were mostly still open, so their loss proxies cover only
+resolved loans.
+
+Malformed numeric text is excluded before casting. Missing financial values are
+not zero. Rates require at least 100 relevant outcomes by default
 (`--min-outcomes`); this is a reporting threshold, not statistical validation.
-Coverage and exclusions are shown in the report. Read times do not establish
-when the underlying repayment outcomes were observed. The report cannot certify
-that imports are complete or deduplicated.
+Read times do not establish when the underlying repayment outcomes were
+observed. The report cannot certify that imports are complete or deduplicated.
 
 The baseline defaults to 660 for comparison; it is not an established policy.
 No cutoff is selected unless you supply your own `--max-loss-rate` as a fraction.
@@ -117,38 +170,19 @@ approval rates or prove a causal effect of changing policy.
 
 Rejected `Risk_Score` is FICO before November 5, 2013 and VantageScore after that
 date according to `data/LCDataDictionary.xlsx`, which does not identify the
-VantageScore version/range. Numeric rejected screens are therefore reported
-separately, with no inferred repayment outcomes or claimed creditworthy demand.
-The optional `--assume-comparable-scores`, `--rejected-loss-rate`, and
-`--take-up-rate` parameters are explicit user-supplied modeling assumptions;
-they are disabled by default and never represented as measured results.
+VantageScore version/range. Rejected screens are therefore reported separately
+and by score era, with no inferred repayment outcomes or claimed creditworthy
+demand. The optional expansion parameters are explicit user-supplied modeling
+assumptions; they are disabled by default and never represented as measured
+results.
 
-## Read-only SQL tools
+## Customizing and extending
 
-`score_cutoff_tools.py` exposes an allowlist of operations described in
-`score_cutoff_tool_dictionary.json`. The report runner executes the aggregate
-operation once, then reuses the result for calculations and model context.
-The model is an interpreter of those results, not an autonomous SQL agent.
-
-| Tool | Purpose |
-| --- | --- |
-| `inspect_sources` | Check table engines and required columns without scanning records. |
-| `preview_score_cutoff_queries` | Return SQL templates and parameters without connecting. |
-| `get_score_cutoff_aggregates` | Read disjoint score bands from both tables in one consistent snapshot. |
-| `compare_score_cutoffs` | Read aggregates and calculate comparisons and an optional historical candidate. |
-
-```powershell
-.\.venv\Scripts\python.exe .\score_cutoff_tools.py --list-tools
-# MYSQL_PASSWORD must be available locally for a live tool call:
-.\.venv\Scripts\python.exe .\score_cutoff_tools.py --call inspect_sources
-```
-
-Python callers can use `ScoreCutoffTools(DatabaseConfig(...))` for custom source
-settings or inject a trusted `connection_factory(config)`. Model-shaped arguments
-cannot supply arbitrary SQL, credentials, or table names. Invalid arguments fail
-before connection. Database exceptions are sanitized and connections are closed.
-Do not call both aggregate and comparison tools for the same question: each
-would rescan both sources.
+The `loan_analyst/` package is split so that each piece changes independently:
+add an analysis module and it becomes a tool for the analyst, a `call` command
+and (with a renderer) a report section; add a segment column in one place;
+reorder report sections with a flag; swap the model client or database
+connection through `Services`. See "Extending" in `AGENTS.md`.
 
 ## Importing real source data separately
 
@@ -182,8 +216,10 @@ leave that batch's outcome uncertain. Table creation commits separately.
 .\.venv\Scripts\python.exe -m unittest discover -v
 ```
 
-Unit tests use isolated fixtures and fake services only inside test modules;
-those fixtures are not available as report data sources. They cover calculations,
-SQL/read-only boundaries, importer behavior, model requests and validation,
-credential exclusion, and failure preservation. A successful live report run
-separately verifies the actual MySQL and Ollama integration.
+Unit tests use isolated fixtures and fake services only inside `tests/`; those
+fixtures are not available as report data sources. They cover calculations, the
+cube and snapshot files, SQL/read-only boundaries, tool validation, the
+tool-calling loop with a scripted model, evidence checks, the report, ask, chat
+and render workflows, importer behavior, credential exclusion, and failure
+preservation. A successful live report separately verifies the actual MySQL and
+Ollama integration.

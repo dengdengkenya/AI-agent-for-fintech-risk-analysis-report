@@ -1,0 +1,112 @@
+"""Loopback-only Ollama chat client with tool calling and structured output.
+
+API: https://docs.ollama.com/api/chat and https://docs.ollama.com/capabilities/tool-calling
+Requests never use proxies or follow redirects, and only an installed, non-cloud model
+is used. Any object with the same preflight() and chat() methods can replace the client.
+"""
+
+from contextlib import suppress
+import json
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+from .jsonutil import read_json
+from .settings import local_url
+
+MAX_RESPONSE_BYTES = 2_000_000
+MAX_REQUEST_BYTES = 400_000
+
+
+class ModelError(RuntimeError):
+    """An actionable failure that is safe to show without raw service response contents."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ModelError("Ollama redirected the request; use a direct local endpoint")
+
+
+def request_json(base_url, path, *, payload=None, timeout=10):
+    base_url = local_url(base_url)
+    data = None if payload is None else json.dumps(payload, allow_nan=False).encode("utf-8")
+    request = Request(base_url + path, data=data, headers={"Content-Type": "application/json"})
+    # Keep local traffic local even on machines with HTTP_PROXY configured.
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise ModelError("Ollama response exceeds the size limit")
+        result = read_json(raw)
+        if not isinstance(result, dict) or "error" in result:
+            raise ModelError("Ollama returned an invalid or unsuccessful response")
+        return result
+    except HTTPError as error:
+        with suppress(Exception):
+            error.close()  # discard the body unread: service error text is never relayed
+        raise ModelError(f"Ollama HTTP {error.code}; check the local model and server") from None
+    except (URLError, TimeoutError, OSError):
+        raise ModelError("Local Ollama is unavailable or timed out; start Ollama or increase --ollama-timeout") from None
+    except (ValueError, UnicodeError):
+        raise ModelError("Ollama returned invalid JSON") from None
+
+
+class OllamaClient:
+    """Minimal local Ollama client used by the analyst."""
+
+    def __init__(self, config):
+        self.config = config
+        self.metadata = None
+
+    def preflight(self, *, require_tools=True):
+        """Check the installed local model before any expensive database scan; never pull one."""
+        config = self.config
+        models = request_json(config.url, "/api/tags").get("models")
+        if not isinstance(models, list):
+            raise ModelError("Ollama returned an invalid model inventory")
+        model = next((item for item in models if isinstance(item, dict)
+                      and config.model in (item.get("name"), item.get("model"))), None)
+        if model is None:
+            raise ModelError(f"{config.model} is not installed locally; run `ollama pull {config.model}` first")
+        if (model.get("remote_model") or model.get("remote_host")
+                or "cloud" in config.model.lower() or not model.get("size")):
+            raise ModelError("Analysis requires a locally installed model, not a cloud model")
+        capabilities = request_json(config.url, "/api/show", payload={"model": config.model}).get("capabilities")
+        if require_tools and isinstance(capabilities, list) and "tools" not in capabilities:
+            raise ModelError(f"{config.model} does not support tool calling; choose a tools-capable local "
+                             "model such as qwen3:4b")
+        version = request_json(config.url, "/api/version")
+        self.metadata = {"model": config.model, "model_digest": model.get("digest"),
+                         "server_version": version.get("version"), "endpoint": config.url,
+                         "capabilities": capabilities if isinstance(capabilities, list) else None}
+        return self.metadata
+
+    def chat(self, messages, *, tools=None, format=None, num_predict=1024):
+        """One non-streaming chat turn. Thinking is disabled and never stored."""
+        payload = {
+            "model": self.config.model,
+            "messages": json.loads(json.dumps(messages)),  # a snapshot, so later turns cannot alter the record
+            "stream": False, "think": False, "keep_alive": self.config.keep_alive,
+            "options": {"temperature": 0, "seed": 42, "num_ctx": self.config.num_ctx, "num_predict": num_predict},
+        }
+        if tools:
+            payload["tools"] = tools
+        if format is not None:
+            payload["format"] = format
+        if len(json.dumps(payload, ensure_ascii=False)) > MAX_REQUEST_BYTES:
+            raise ModelError("Analysis context is too large; use fewer cutoffs or tool rounds")
+        response = request_json(self.config.url, "/api/chat", payload=payload, timeout=self.config.timeout)
+        if response.get("done") is not True or response.get("done_reason") not in ("stop", "tool_calls"):
+            raise ModelError("Model response was incomplete; no output was replaced")
+        message = response.get("message")
+        content = message.get("content", "") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            raise ModelError("Model returned no message content")
+        calls = []
+        for item in message.get("tool_calls") or []:
+            function = item.get("function") if isinstance(item, dict) else None
+            function = function if isinstance(function, dict) else {}
+            calls.append({"name": function.get("name"), "arguments": function.get("arguments")})
+        return {"request": payload, "content": content, "tool_calls": calls,
+                "usage": {key: response.get(key) for key in (
+                    "prompt_eval_count", "eval_count", "total_duration", "load_duration")}}

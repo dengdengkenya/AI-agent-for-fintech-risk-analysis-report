@@ -2,35 +2,47 @@
 
 ## Project status
 
-Last updated: 2026-11-02.
+Last updated: 2026-11-03.
 
 This project generates historical Lending Club reports from existing MySQL
-accepted/rejected tables and adds local Ollama/Qwen interpretation. Reporting
-has no synthetic mode, sample CSV input, or CSV fallback. The local schema is
-named `demo`; that name does not make its imported loan tables synthetic.
+accepted/rejected tables. A local Ollama/Qwen analyst investigates the results by
+calling allowlisted analysis tools and writes evidence-checked commentary; it also
+answers questions (`ask`, `chat`). Reporting has no synthetic mode, sample CSV
+input, or CSV fallback. The local schema is named `demo`; that name does not make
+its imported loan tables synthetic.
 
 `CLAUDE.md` is a relative symbolic link to `AGENTS.md`. Edit `AGENTS.md` to update
 the shared instructions; preserve the link rather than creating a second copy.
 
-| File | Purpose |
+The code is the `loan_analyst/` package. Each layer can be used or replaced alone:
+
+| Path | Purpose |
 | --- | --- |
-| `generate_framework_report.py` | Primary MySQL/Qwen runner; writes `report.md`, `aggregates.json`, and `ollama_analysis.json` to `outputs/framework_report/`. |
-| `score_cutoff_simulation.py` | Shared query construction, deterministic calculations and Markdown rendering; CLI delegates to the same runner with `outputs/score_cutoff/`. |
-| `score_cutoff_sql.py` | MySQL connection, schema checks, and aggregates in a read-only consistent snapshot. |
-| `score_cutoff_tools.py` | Allowlisted JSON-callable MySQL operations and host-controlled configuration. |
-| `score_cutoff_tool_dictionary.json` | Function argument schemas, output definitions, and interpretation rules. |
-| `ollama_analysis.py` | Loopback-only Ollama preflight, structured analysis, evidence validation and rendering. |
+| `loan_analyst/cli.py`, `__main__.py` | Command line: `python -m loan_analyst report \| ask \| chat \| render \| tools \| call \| sql \| snapshot`. |
+| `loan_analyst/pipeline.py` | Workflows built from small steps and injectable `Services` (connections, model client, clock, terminal I/O). |
+| `loan_analyst/settings.py` | Validated `DatabaseConfig`, `Scenario`, `ModelConfig`; TOML defaults (see `loan_analyst.example.toml`). |
+| `loan_analyst/db.py` | Credentials, connections, read-only transactions and table metadata; knows nothing about loans. |
+| `loan_analyst/cube.py` | Grouped snapshot SQL, `Cube`/`Snapshot`, cohort and band selection, snapshot files. |
+| `loan_analyst/analyses/` | Analysis plug-ins (`overview`, `cutoffs`, `segments`, `rejected`), each with tools, facts and report tables; `definitions.py` holds citable domain definitions. |
+| `loan_analyst/tools.py` | Tool registry: JSON schemas, argument validation and sanitized dispatch. |
+| `loan_analyst/evidence.py` | Fact ledger and validation of model statements against cited facts. |
+| `loan_analyst/llm.py`, `agent.py`, `prompts.py` | Loopback Ollama client, the tool-calling analyst loop, and editable prompts. |
+| `loan_analyst/report.py` | Composable report sections and answer rendering. |
+| `generate_framework_report.py` | Compatibility entry point, equal to `python -m loan_analyst report`. |
 | `import_csv_to_mysql.py` | Separate streaming administrative importer for the real CSV sources; supports `--dry-run`. |
-| `test_*.py` | Offline regression tests; fixtures and fake database/model services are confined to tests. |
+| `tests/` | Offline regression tests; fixtures and fake database/model services are confined to tests. |
 
-The sample generator, CSV preview, standalone Ollama greeting check, and tracked
-sample CSVs have been removed. Do not reintroduce demo sources or silently use
-saved/synthetic aggregates when a database query fails.
+On 2026-11-03 the former `score_cutoff_*.py` modules, `ollama_analysis.py` and
+`score_cutoff_tool_dictionary.json` were folded into the package;
+`python -m loan_analyst tools` prints the generated tool catalog. Do not
+reintroduce demo sources or silently use saved/synthetic aggregates when a
+database query fails.
 
-Verified on 2026-11-02: 60 offline tests pass. A live read of `demo.accepted`
-counted 2,260,669 rows and `demo.rejected` counted 27,648,741 rows. Local
-`qwen3:4b` generated analysis from that snapshot; the delivered report's wording
-was reviewed, with its original model draft retained in the evidence file.
+Verified on 2026-11-03: 83 offline tests pass (Python 3.14.6 on macOS). The new
+grouped snapshot SQL and the tool-calling analyst have not yet been run against
+the live tables or a local model; run a live report and record the result here.
+The 2026-11-02 live checks (`demo.accepted` 2,260,669 rows, `demo.rejected`
+27,648,741 rows, local `qwen3:4b`) used the previous query and prompt design.
 These checks do not certify import completeness or deduplication.
 
 ## Environment and validation
@@ -48,55 +60,100 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m unittest discover -v
 
 # SQL preview; no database/model connection or output writes:
-.\.venv\Scripts\python.exe .\generate_framework_report.py --print-sql
+.\.venv\Scripts\python.exe -m loan_analyst sql
 
-# Live report: reads MySQL and invokes local Qwen; writes local report files:
-.\.venv\Scripts\python.exe .\generate_framework_report.py
+# Live report: reads MySQL once, saves a snapshot, then the local analyst runs tools:
+.\.venv\Scripts\python.exe -m loan_analyst report
+
+# Reuse the last saved snapshot instead of scanning MySQL again:
+.\.venv\Scripts\python.exe -m loan_analyst report --snapshot latest
+.\.venv\Scripts\python.exe -m loan_analyst ask "Which cutoff keeps losses under 8%?" --snapshot latest
 
 # Bounded CSV validation, separate from reporting:
 .\.venv\Scripts\python.exe .\import_csv_to_mysql.py --dry-run --rows 100
 ```
 
-Tests create temporary fixtures under `outputs/` and clean them up. Report
-queries scan the full tables even with cohort filters and can take minutes;
-`--query-timeout` defaults to 600 seconds per SELECT. Run live validation when
-needed and report it separately from offline checks. An offline pass does not
-establish current service availability or a complete/deduplicated import.
+Tests create temporary fixtures under `outputs/` and clean them up. A snapshot
+scans each full table once and can take minutes; `--query-timeout` defaults to
+600 seconds per SELECT. Every analysis and model tool call afterwards is computed
+in memory. Run live validation when needed and report it separately from offline
+checks. An offline pass does not establish current service availability or a
+complete/deduplicated import.
 
 ## Reporting and model boundaries
 
 - Defaults: `localhost:3306`, user `root`, schema `demo`, tables `accepted` and
   `rejected`. Credentials come from `MYSQL_PASSWORD` or a local terminal prompt,
-  never code, documentation, command-line arguments, model context, or evidence.
-- Source tables must be InnoDB with the required columns. Both are checked
-  before scans. Use parameterized values and quoted identifiers. Report reads
-  share one read-only repeatable snapshot and roll back/close before generation.
-- Only grouped counts, sums, and month bounds leave MySQL. Python calculates
-  all rates, coverage and candidate selection. Missing financial data are not
-  zero. Open/unknown/legacy statuses are excluded from terminal outcome rates.
+  never code, documentation, config files, command-line arguments, model context,
+  or evidence.
+- Source tables must be InnoDB with the required columns; optional `grade` and
+  `term` columns add segments when present. Both tables are checked before scans.
+  Quote identifiers; the snapshot SQL has no bound values. Snapshot reads share one
+  read-only repeatable transaction and roll back/close before any analysis.
+- Only grouped counts and sums by cohort month, score and optional grade/term
+  leave MySQL. Python calculates cohorts, bands, rates, coverage and candidate
+  selection. Missing financial data are not zero. Open/unknown/legacy statuses
+  are excluded from terminal outcome rates.
+- Each read is saved under `outputs/snapshots/` with a content hash. Saved
+  snapshots are used only when `--snapshot PATH|latest` is given, are checked
+  against their hash and table names, and are never a fallback for a failed read.
 - Rejected scores are not generally comparable to original accepted FICO.
-  Rejected repayment outcomes are absent. Optional expansion parameters are
-  explicit user assumptions, disabled by default; never present them as facts.
+  Rejected repayment outcomes are absent. Expansion parameters are explicit user
+  assumptions (flags or config), disabled by default and never tool arguments;
+  never present them as facts.
 - Ollama defaults: `http://localhost:11434`, `qwen3:4b`, 300 seconds per request,
-  at most one validation retry, temperature zero, thinking disabled, five-minute
-  keep-alive. Preflight verifies an installed local model before database scans.
+  temperature zero, thinking disabled, five-minute keep-alive, at most 4 tool
+  rounds and 8 tool calls, and one answer repair. Preflight verifies an installed
+  local, tool-capable model before database scans.
 - Endpoint must be loopback HTTP. Disable proxies and redirects; reject cloud
-  models. Never fall back to an external AI service. No model-directed SQL or
-  tool execution occurs. Qwen receives only bounded deterministic aggregate facts.
-- Require short structured sections and valid evidence references. Numeric
-  magnitudes/units in prose must appear in cited facts; Python also renders those
-  facts. These checks are not semantic verification; label model-generated text.
-  If reviewing/editing generated prose, retain the original as `model_draft` and
-  record the edits in `review`; keep the original request intact.
-- Model failures fail the run before replacing existing outputs. `--no-ai` is an
-  explicit MySQL-only mode and writes a disabled-status model evidence file.
-  `--print-sql` connects to neither service. `--demo` is unsupported everywhere.
-- All three artifacts carry one run ID and source evidence hash. Preserve the
-  exact model request, model digest, validated response, and usage for review;
-  do not save model thinking or raw service error bodies. Read timestamps do not
-  establish the underlying repayment observation date.
-- Paths resolve relative to `PROJECT_ROOT = Path(__file__).resolve().parent`.
-  Reruns replace report artifacts; select another output directory to retain runs.
+  models. Never fall back to an external AI service.
+- The model may call only tools registered by `loan_analyst/analyses`; `tools.py`
+  validates arguments against their schemas before execution. Tools compute over
+  the in-memory snapshot, cannot reach MySQL, and accept no SQL, credentials,
+  hosts, table names, paths or expansion assumptions. The model receives fact
+  sentences only, never cube rows, SQL or connection settings.
+- Every model statement cites fact IDs (`def.*`, `t<n>.*`). Numeric magnitudes and
+  units in prose must appear in its cited facts, and accept/reject/approve/deny
+  wording is refused. After one repair attempt, statements that still fail are
+  withheld and listed in `ollama_analysis.json`; the run fails if the main answer
+  cannot be validated. These checks are not semantic verification; label
+  model-generated text.
+- Model failures fail the run before replacing existing report outputs; the saved
+  snapshot allows a quick rerun. `--no-ai` is an explicit MySQL-only mode and
+  writes a disabled-status model evidence file. `sql` and `--print-sql` connect to
+  neither service. `--demo` is unsupported everywhere.
+- A report folder holds `report.md`, `aggregates.json` (settings, snapshot
+  provenance, every report-step result and fact), `snapshot.json` (the grouped
+  aggregates and SQL, with its content hash) and `ollama_analysis.json` (exact
+  requests, tool definitions, tool calls and results, validated answer, withheld
+  statements, model digest, usage). `aggregates.json` and `ollama_analysis.json`
+  share one run ID and source evidence hash. Do not save model thinking or raw
+  service error bodies. Read timestamps do not establish the repayment
+  observation date.
+- To review wording, edit `answer` in `ollama_analysis.json`, keep `model_draft`
+  unchanged, describe the edits in `review`, then run
+  `python -m loan_analyst render DIR`. Rendering re-validates the evidence and
+  refuses unrecorded edits. Keep the original requests intact.
+- Paths resolve relative to `PROJECT_ROOT` (the repository root, defined in
+  `loan_analyst/__init__.py`). Reruns replace report artifacts; select another
+  output directory to retain runs.
+
+## Extending
+
+- New analysis: add a module under `loan_analyst/analyses/` with pure
+  `analyze`/`facts` functions and a `TOOLS` tuple of `tools.Tool` (JSON schema
+  plus a handler returning `ToolOutput`), then list it in `analyses.MODULES`.
+  Write every number the model may quote into a fact.
+- New segment column: add a validated `Dimension` to `cube.DIMENSIONS` and a
+  grouping in `analyses/segments.py`.
+- Report layout: reorder or drop sections with `--sections` or the `[report]`
+  config table; add renderers to `report.SECTIONS` and deterministic steps to
+  `pipeline.REPORT_CALLS`.
+- Wording: prompts live in `prompts.py` (bump `VERSION` when changing them) and
+  citable definitions in `analyses/definitions.py`.
+- Another local model server: pass any object with `preflight()` and
+  `chat(messages, tools=, format=, num_predict=)` through `Services.model_factory`.
+  It must stay loopback-only.
 
 ## Source data and importer safeguards
 
