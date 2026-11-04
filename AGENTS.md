@@ -2,7 +2,7 @@
 
 ## Project status
 
-Last updated: 2026-11-03.
+Last updated: 2026-11-04.
 
 This project generates historical Lending Club reports from existing MySQL
 accepted/rejected tables. A local Ollama/Qwen analyst investigates the results by
@@ -38,12 +38,21 @@ On 2026-11-03 the former `score_cutoff_*.py` modules, `ollama_analysis.py` and
 reintroduce demo sources or silently use saved/synthetic aggregates when a
 database query fails.
 
-Verified on 2026-11-03: 83 offline tests pass (Python 3.14.6 on macOS). The new
-grouped snapshot SQL and the tool-calling analyst have not yet been run against
-the live tables or a local model; run a live report and record the result here.
-The 2026-11-02 live checks (`demo.accepted` 2,260,669 rows, `demo.rejected`
-27,648,741 rows, local `qwen3:4b`) used the previous query and prompt design.
-These checks do not certify import completeness or deduplication.
+Verified on 2026-11-04: 87 offline tests pass (Python 3.13.7 on Windows).
+The user's live grouped read completed in 396.4s and saved snapshot
+`20261104T010032Z-4dbb63a3`: `demo.accepted` 2,260,669 rows and `demo.rejected`
+27,648,741 rows. Its content hash was verified locally. The subsequent model
+failure was reproduced from that snapshot: `qwen3:4b` resolved to Qwen3 4B
+Thinking 2507 and stopped with `done_reason=length` after 1,024 generated tokens.
+Preflight now rejects this thinking-only variant before scanning MySQL; the
+default is the explicit Instruct variant below. A live saved-snapshot report
+with that model on Ollama 0.40.13 completed in 473.1s: two investigation rounds,
+four tool calls, one answer repair, 12 validated statements and none withheld.
+Prompt `analyst-v3` selects citations before drafting and copies quantitative
+sentences from their source fact to reduce citation mismatches. All four
+artifacts in `outputs/framework_report/` were checked for matching run/evidence
+IDs and `render` passed revalidation. MySQL was not queried again. These checks
+do not certify import completeness or deduplication.
 
 ## Environment and validation
 
@@ -101,10 +110,13 @@ complete/deduplicated import.
   Rejected repayment outcomes are absent. Expansion parameters are explicit user
   assumptions (flags or config), disabled by default and never tool arguments;
   never present them as facts.
-- Ollama defaults: `http://localhost:11434`, `qwen3:4b`, 300 seconds per request,
+- Ollama defaults: `http://localhost:11434`, `qwen3:4b-instruct-2507-q4_K_M`, 300 seconds per request,
   temperature zero, thinking disabled, five-minute keep-alive, at most 4 tool
   rounds and 8 tool calls, and one answer repair. Preflight verifies an installed
-  local, tool-capable model before database scans.
+  local, tool-capable model before database scans and rejects known thinking-only
+  models that cannot honor disabled thinking, including aliases identified by
+  GGUF metadata. Hybrid models that allow thinking to be disabled remain valid.
+  A token-limit response is discarded before any partial tool call can execute.
 - Endpoint must be loopback HTTP. Disable proxies and redirects; reject cloud
   models. Never fall back to an external AI service.
 - The model may call only tools registered by `loan_analyst/analyses`; `tools.py`

@@ -5,10 +5,22 @@ import unittest
 from loan_analyst.settings import (DatabaseConfig, ModelConfig, Scenario, SettingsError, load_config, local_url,
                                    project_path)
 from loan_analyst import PROJECT_ROOT
+from loan_analyst.cli import build_parser
 from tests.fixtures import temporary_directory
 
 
 class SettingsTests(unittest.TestCase):
+    def test_model_default_is_consistent_across_entry_points_and_example_config(self):
+        expected = "qwen3:4b-instruct-2507-q4_K_M"
+        self.assertEqual(ModelConfig().model, expected)
+        parser = build_parser()
+        for argv in (["report"], ["ask", "Question?"], ["chat"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(parser.parse_args(argv).ollama_model, expected)
+        self.assertEqual(load_config(PROJECT_ROOT / "loan_analyst.example.toml")["model"]["model"], expected)
+        self.assertEqual(parser.parse_args(["report", "--ollama-model", "custom-local"]).ollama_model,
+                         "custom-local")
+
     def test_cutoffs_are_sorted_unique_and_include_baseline(self):
         self.assertEqual(Scenario(cutoffs="740,600,740", baseline=680).cutoffs, (600, 680, 740))
         self.assertEqual(Scenario(cutoffs=[700, 600], baseline=650).cutoffs, (600, 650, 700))

@@ -156,7 +156,7 @@ class ModelConfig:
     """Local Ollama settings. Only loopback endpoints and installed local models are used."""
 
     url: str = "http://localhost:11434"
-    model: str = "qwen3:4b"
+    model: str = "qwen3:4b-instruct-2507-q4_K_M"
     timeout: int = 300
     keep_alive: str = "5m"
     num_ctx: int = 16384

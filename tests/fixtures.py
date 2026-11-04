@@ -12,7 +12,7 @@ import tempfile
 from loan_analyst import PROJECT_ROOT
 from loan_analyst.cube import ACCEPTED, REJECTED, REQUIRED, Cube, Snapshot
 from loan_analyst.pipeline import Services
-from loan_analyst.settings import Scenario
+from loan_analyst.settings import ModelConfig, Scenario
 
 OPTIONAL = {ACCEPTED: {"grade", "term"}, REJECTED: set()}
 
@@ -121,7 +121,7 @@ class FakeConnection:
         self.closed = True
 
 
-METADATA = {"model": "qwen3:4b", "model_digest": "test-digest", "server_version": "test",
+METADATA = {"model": ModelConfig.model, "model_digest": "test-digest", "server_version": "test",
             "endpoint": "http://localhost:11434", "capabilities": ["completion", "tools"]}
 
 
@@ -136,7 +136,7 @@ class ScriptedModel:
         return self.metadata
 
     def chat(self, messages, *, tools=None, format=None, num_predict=1024):
-        payload = {"model": "qwen3:4b", "messages": deepcopy(messages), "stream": False, "think": False,
+        payload = {"model": ModelConfig.model, "messages": deepcopy(messages), "stream": False, "think": False,
                    "options": {"temperature": 0, "num_predict": num_predict}}
         if tools:
             payload["tools"] = tools

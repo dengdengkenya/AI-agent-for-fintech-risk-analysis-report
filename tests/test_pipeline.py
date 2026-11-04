@@ -12,6 +12,7 @@ from loan_analyst import PROJECT_ROOT, cli
 from loan_analyst.analyses import cutoffs
 from loan_analyst.cube import Snapshot, save_snapshot
 from loan_analyst.llm import ModelError
+from loan_analyst.settings import ModelConfig
 from tests.fixtures import (FakeConnection, ScriptedModel, calls, done, grounded, make_snapshot, scenario, services,
                             statement, temporary_directory)
 
@@ -23,7 +24,7 @@ class MissingModel:
     metadata = None
 
     def preflight(self):
-        raise ModelError("qwen3:4b is not installed locally")
+        raise ModelError(f"{ModelConfig.model} is not installed locally")
 
 
 class PipelineTests(unittest.TestCase):

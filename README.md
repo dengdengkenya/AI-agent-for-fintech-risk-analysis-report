@@ -19,7 +19,7 @@ Run from this project in PowerShell. MySQL 8.0+ and local Ollama must be running
 # First-time setup only, if the environment is missing:
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-ollama pull qwen3:4b
+ollama pull qwen3:4b-instruct-2507-q4_K_M
 
 # Full report; enter the MySQL password at the prompt (or set MYSQL_PASSWORD):
 .\.venv\Scripts\python.exe -m loan_analyst report
@@ -33,6 +33,30 @@ seconds plus model time:
 .\.venv\Scripts\python.exe -m loan_analyst ask "Which cutoff keeps losses under 8% for 2012-2015 loans?" --snapshot latest
 .\.venv\Scripts\python.exe -m loan_analyst chat --snapshot latest
 ```
+
+The default model is `qwen3:4b-instruct-2507-q4_K_M`, an explicit non-thinking
+variant. Choose another installed local model with `--ollama-model` or the
+`[model]` config table; it must support tools and allow thinking to be disabled.
+
+### Recovering from an incomplete model response
+
+A saved snapshot survives model failures. If a run stops with "Model response
+was incomplete", reuse it instead of scanning MySQL again. The local `qwen3:4b`
+alias was found to point to Qwen3 4B Thinking 2507 on 2026-11-04; it exhausted the
+1,024-token investigation budget despite `think: false`. Known thinking-only
+models are now rejected during preflight, before any database scan.
+
+Install the explicit Instruct variant and select it when rerunning, including
+when an existing `loan_analyst.toml` still names the old alias:
+
+```powershell
+ollama pull qwen3:4b-instruct-2507-q4_K_M
+.\.venv\Scripts\python.exe -m loan_analyst report --snapshot latest --ollama-model qwen3:4b-instruct-2507-q4_K_M
+```
+
+Update `[model].model` in your local config to keep that choice for future runs.
+Increasing `--ollama-timeout` does not change the generated-token limit or make
+a thinking-only model obey `think: false`.
 
 ## Everyday commands
 
@@ -79,8 +103,9 @@ explicit expansion assumptions `--assume-comparable-scores`,
 3. **Investigation.** The model sees the key facts and may call tools for up to
    4 rounds and 8 calls (`--max-tool-rounds`, `--max-tool-calls`). Tools compute
    in memory, so the model never triggers another database scan.
-4. **Evidence-checked answer.** The model returns a headline, findings, caveats
-   and next steps, each citing fact IDs. Python checks that every number is
+4. **Evidence-checked answer.** The model chooses supporting fact IDs before
+   drafting each headline, finding, caveat and next step. Quantitative sentences
+   are requested as exact copies from one cited fact. Python checks that every number is
    copied from the cited facts and that no statement calls a cutoff an
    approval or rejection. Failing statements get one repair attempt; any that
    still fail are withheld and listed. If the headline cannot be validated, the

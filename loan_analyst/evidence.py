@@ -67,10 +67,11 @@ class Ledger:
 
 def answer_schema(sections, evidence_ids):
     """Structured-output schema; evidence IDs are restricted to facts the model has seen."""
-    item = {"type": "object", "additionalProperties": False, "required": ["text", "evidence_ids"],
-            "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 500},
-                           "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 4,
-                                            "items": {"type": "string", "enum": list(evidence_ids)}}}}
+    # Select the source before drafting the claim in constrained generation.
+    item = {"type": "object", "additionalProperties": False, "required": ["evidence_ids", "text"],
+            "properties": {"evidence_ids": {"type": "array", "minItems": 1, "maxItems": 4,
+                                            "items": {"type": "string", "enum": list(evidence_ids)}},
+                           "text": {"type": "string", "minLength": 1, "maxLength": 500}}}
     return {"type": "object", "additionalProperties": False, "required": list(sections),
             "properties": {name: {"type": "array", "minItems": low, "maxItems": high, "items": item}
                            for name, (low, high) in sections.items()}}

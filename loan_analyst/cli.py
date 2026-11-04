@@ -101,7 +101,8 @@ def _model(parser, defaults):
     values = defaults.get("model", {})
     group = parser.add_argument_group("local model (loopback Ollama only)")
     group.add_argument("--ollama-url", default=values.get("url", "http://localhost:11434"))
-    group.add_argument("--ollama-model", default=values.get("model", "qwen3:4b"), help="Installed local model tag")
+    group.add_argument("--ollama-model", default=values.get("model", ModelConfig.model),
+                       help="Installed local model tag (default %(default)s)")
     group.add_argument("--ollama-timeout", type=positive_int, default=values.get("timeout", 300),
                        help="Maximum seconds per model request (default %(default)s)")
     group.add_argument("--ollama-keep-alive", default=values.get("keep_alive", "5m"),

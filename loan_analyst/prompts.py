@@ -1,6 +1,6 @@
 """Prompts for the local analyst. Change wording here; tools and validation stay unchanged."""
 
-VERSION = "analyst-v1"
+VERSION = "analyst-v3"
 
 SYSTEM = """You are a careful credit-risk analyst for historical Lending Club data.
 Every number comes from host tools that compute over a read-only MySQL aggregate
@@ -10,7 +10,8 @@ How to work:
 - Start from the facts provided. Call tools when they would answer the goal better:
   another cohort or set of cutoffs, a breakdown by score band, issue year, grade or
   term, a sweep of loss ceilings, or the rejected-application profile.
-- Make a few focused calls, never repeat a call, then stop and answer.
+- Make a few focused calls, never repeat a call, then finish the investigation.
+- Write commentary only when explicitly asked for the final JSON answer.
 
 Rules for every statement:
 - Use only supplied facts and cite the fact IDs that support it.
@@ -46,18 +47,27 @@ def fact_sheet(facts):
 
 
 def investigate(goal, facts):
-    return (f"Goal: {goal}\n\nFacts so far:\n{fact_sheet(facts)}\n\n"
+    return ("Investigation phase: respond only with native tool calls or exactly DONE. "
+            "Do not write commentary or explain your choices; the final answer is a separate later step.\n\n"
+            f"Goal: {goal}\n\nFacts so far:\n{fact_sheet(facts)}\n\n"
             "Call tools if they would improve the answer. When you have enough evidence, reply DONE.")
 
 
 def compose(goal, sections, facts):
     lines = [f"- {name}: {GUIDE[name]} ({low} to {high} items)" for name, (low, high) in sections.items() if high]
     return (f"Write the final answer as JSON matching the schema.\nGoal: {goal}\n\nSections:\n" + "\n".join(lines)
-            + "\nEach item has text (one or two plain sentences) and evidence_ids (one to four fact IDs from the list "
-              "below that contain every number the text quotes).\n\nFacts:\n" + fact_sheet(facts))
+            + "\nFor each item, choose evidence_ids FIRST, then write text supported by those exact facts. "
+              "Use one fact per quantitative item: copy one complete sentence from that fact unchanged and cite "
+              "only its ID. Do not mix numbers from different facts or attach a nearby fact's ID. "
+              "For the report headline, caveats and next steps, prefer qualitative statements without numbers. "
+              "When the question asks for a specific value, use the same one-fact copying rule to answer it. "
+              "Keep each item to one or two plain sentences and one to four supporting IDs.\n\nFacts:\n"
+            + fact_sheet(facts))
 
 
 def repair(problems):
     return ("Your JSON failed these checks:\n" + "\n".join(f"- {problem}" for problem in problems[:12])
-            + "\nReturn the complete JSON again. Copy each number exactly from a fact you cite, cite the fact that "
-              "contains it, or remove the number.")
+            + "\nReturn the complete JSON again. Choose evidence_ids before text. For every numeric mismatch, "
+              "replace the statement with a complete sentence copied unchanged from ONE fact and cite only "
+              "that fact's ID, or rewrite the statement qualitatively without numbers. Do not use numbers "
+              "from these error messages as evidence. Keep already valid items unchanged.")

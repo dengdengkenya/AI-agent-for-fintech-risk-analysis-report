@@ -54,7 +54,7 @@ class OllamaClientTests(unittest.TestCase):
             self.assertNotIn("private value", str(raised.exception))
 
     def test_preflight_requires_an_installed_local_tool_capable_model(self):
-        installed = {"models": [{"name": "qwen3:4b", "size": 100, "digest": "d"}]}
+        installed = {"models": [{"name": self.client.config.model, "size": 100, "digest": "d"}]}
         tools = {"capabilities": ["completion", "tools"]}
         with patch.object(llm, "request_json", side_effect=[installed, tools, {"version": "0.12"}]):
             metadata = self.client.preflight()
@@ -62,12 +62,54 @@ class OllamaClientTests(unittest.TestCase):
         with patch.object(llm, "request_json", side_effect=[installed, {}, {"version": "old"}]):
             self.assertIsNone(self.client.preflight()["capabilities"])
         failures = [[{"models": []}], [{"models": None}],
-                    [{"models": [{"name": "qwen3:4b", "size": 100, "remote_host": "cloud"}]}],
+                    [{"models": [{"name": self.client.config.model, "size": 100, "remote_host": "cloud"}]}],
                     [installed, {"capabilities": ["completion"]}]]
         for replies in failures:
             with self.subTest(replies=replies), patch.object(llm, "request_json", side_effect=replies), \
                  self.assertRaises(llm.ModelError):
                 self.client.preflight()
+
+    def test_preflight_rejects_thinking_only_models_even_under_an_alias(self):
+        client = llm.OllamaClient(ModelConfig(model="local-analyst:latest"))
+        installed = {"models": [{"name": client.config.model, "size": 100}]}
+        for details in (
+            {"thinking": {"values": [True], "default": True}},
+            {"thinking": {"values": ["low", "high"], "default": "low"}},
+            {"model_info": {"general.architecture": "qwen3", "general.finetune": "Thinking"}},
+            {"model_info": {"general.name": "Qwen3 4B Thinking 2507"}},
+        ):
+            with self.subTest(details=details), patch.object(llm, "request_json", side_effect=[
+                    installed, {"capabilities": ["completion", "tools"], **details}]) as request:
+                with self.assertRaisesRegex(llm.ModelError, "thinking-only") as raised:
+                    client.preflight()
+                self.assertIn("--ollama-model " + ModelConfig().model, str(raised.exception))
+                self.assertIn("--snapshot latest", str(raised.exception))
+                self.assertEqual([call.args[1] for call in request.call_args_list], ["/api/tags", "/api/show"])
+
+    def test_preflight_allows_hybrid_and_non_thinking_models(self):
+        installed = {"models": [{"name": self.client.config.model, "size": 100}]}
+        for details in (
+            {"thinking": {"values": [True, False]}},
+            {"thinking": {"values": [False]}},
+            {"model_info": {"general.name": "Qwen3 4B", "general.architecture": "qwen3"}},
+            {"model_info": {"general.name": "Qwen3 4B Instruct 2507", "general.finetune": "Instruct"}},
+        ):
+            with self.subTest(details=details), patch.object(llm, "request_json", side_effect=[
+                    installed, {"capabilities": ["completion", "tools"], **details}, {"version": "test"}]):
+                self.assertEqual(self.client.preflight()["server_version"], "test")
+
+    def test_token_limit_discards_partial_tools_and_gives_safe_recovery_hint(self):
+        partial = response("private partial content", [{"function": {
+            "name": "describe_data", "arguments": {}}}], done_reason="length")
+        with patch.object(llm, "request_json", return_value=partial) as request:
+            with self.assertRaisesRegex(llm.ModelError, "response token limit") as raised:
+                self.client.chat([], num_predict=1024)
+        request.assert_called_once()
+        message = str(raised.exception)
+        self.assertIn("num_predict=1024", message)
+        self.assertIn("--snapshot latest", message)
+        self.assertNotIn("private partial content", message)
+        self.assertNotIn("internal reasoning", message)
 
     def test_chat_is_local_deterministic_and_records_an_immutable_request(self):
         messages = [{"role": "user", "content": "question"}]

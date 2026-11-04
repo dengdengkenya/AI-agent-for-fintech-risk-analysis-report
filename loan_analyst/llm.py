@@ -11,10 +11,30 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 from .jsonutil import read_json
-from .settings import local_url
+from .settings import ModelConfig, local_url
 
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_REQUEST_BYTES = 400_000
+
+
+def _requires_thinking(details):
+    """Recognize thinking-only models even when an alias hides their variant.
+
+    New servers advertise thinking controls. Older Ollama versions expose the
+    GGUF identity instead; Qwen3 Thinking releases cannot honor think=False.
+    Hybrid Qwen3 models remain supported.
+    """
+    thinking = details.get("thinking")
+    values = thinking.get("values") if isinstance(thinking, dict) else None
+    if isinstance(values, list) and values:
+        return not any(value is False for value in values)
+    info = details.get("model_info")
+    if not isinstance(info, dict):
+        return False
+    name = str(info.get("general.name", "")).lower()
+    family = str(info.get("general.architecture", "")).lower()
+    finetune = str(info.get("general.finetune", "")).lower()
+    return (family == "qwen3" or "qwen3" in name) and ("thinking" in name or "thinking" in finetune)
 
 
 class ModelError(RuntimeError):
@@ -71,10 +91,16 @@ class OllamaClient:
         if (model.get("remote_model") or model.get("remote_host")
                 or "cloud" in config.model.lower() or not model.get("size")):
             raise ModelError("Analysis requires a locally installed model, not a cloud model")
-        capabilities = request_json(config.url, "/api/show", payload={"model": config.model}).get("capabilities")
+        details = request_json(config.url, "/api/show", payload={"model": config.model})
+        capabilities = details.get("capabilities")
         if require_tools and isinstance(capabilities, list) and "tools" not in capabilities:
             raise ModelError(f"{config.model} does not support tool calling; choose a tools-capable local "
-                             "model such as qwen3:4b")
+                             f"model such as {ModelConfig().model}")
+        if _requires_thinking(details):
+            recommended = ModelConfig().model
+            raise ModelError(f"{config.model} resolves to a thinking-only model and cannot disable thinking. "
+                             f"Run `ollama pull {recommended}`, then use --ollama-model {recommended}. "
+                             "Reuse an existing snapshot with --snapshot latest; MySQL was not queried")
         version = request_json(config.url, "/api/version")
         self.metadata = {"model": config.model, "model_digest": model.get("digest"),
                          "server_version": version.get("version"), "endpoint": config.url,
@@ -96,6 +122,11 @@ class OllamaClient:
         if len(json.dumps(payload, ensure_ascii=False)) > MAX_REQUEST_BYTES:
             raise ModelError("Analysis context is too large; use fewer cutoffs or tool rounds")
         response = request_json(self.config.url, "/api/chat", payload=payload, timeout=self.config.timeout)
+        if response.get("done_reason") == "length":
+            raise ModelError(f"Ollama reached the response token limit (num_predict={num_predict}); "
+                             "the partial response was discarded and no output was replaced. "
+                             "Use a model that supports disabled thinking and fewer tool rounds; "
+                             "reuse the saved data with --snapshot latest")
         if response.get("done") is not True or response.get("done_reason") not in ("stop", "tool_calls"):
             raise ModelError("Model response was incomplete; no output was replaced")
         message = response.get("message")
