@@ -1,203 +1,213 @@
 # Reading and changing the loan analyst
 
-This application answers questions about historical loans. Python calculates
-the numbers; a local language model chooses additional analyses and writes
-commentary using those numbers. The model does not query the database or
-calculate the report's rates.
+This program answers questions about historical Lending Club loans. Python
+calculates every number; a local language model chooses extra analyses and
+writes commentary that cites those numbers. The model never sees borrower rows,
+SQL, credentials or connection settings.
 
-You can understand and test the code without running MySQL or Ollama. Start
-with the workflow below, then follow the reading order. The [README](../README.md)
-covers operating the application, and [AGENTS.md](../AGENTS.md) records project
-constraints and live validation history.
+You can read, run and test the code without MySQL or Ollama. The tests use a
+small fake snapshot and a scripted model.
 
-## Follow the data
+The code is arranged as a few larger, cohesive files rather than many tiny
+modules. That is deliberate: one idea lives in one place, and you rarely have
+to follow a call through five files. Start with the six-step workflow below.
+
+## The whole report in six steps
+
+Open [`loan_analyst/workflow.py`](../loan_analyst/workflow.py) and read
+`run_report` from top to bottom. It is the application:
 
 ```text
-Command-line arguments + optional TOML config
-    |
-    v
-Validated settings
-    |
-    v
-MySQL grouped read OR an explicitly requested saved snapshot
-    |
-    v
-Snapshot: accepted cube + rejected cube + source information
-    |
-    v
-Analysis functions: calculated results + citable fact sentences
-    |
-    +--> Local model requests more analyses through the tool registry
-    |        |
-    |        v
-    |    Model answer --> Python evidence checks
-    |        |
-    v        v
-Report tables + validated commentary --> Markdown and JSON files
+1. check the local model              (before an expensive database read)
+2. get a Snapshot                     (read MySQL once, or load a saved file)
+3. run the standard analyses          (REPORT_CALLS, through the tool registry)
+4. freeze the evidence                (results + facts + content hashes)
+5. ask the analyst for commentary     (optional; --no-ai skips this)
+6. render and write four files        (report.md + three JSON files)
 ```
 
-A **cohort** is the selected range of loan issue months (or rejected application
-months). A **cutoff** retains scores at or above a threshold. A **score band**
-contains scores in one range: below the first threshold, between adjacent
-thresholds, or at and above the last threshold. These bands do not overlap.
+Each step is a comment in that function, and each step uses one clear piece of
+the package:
 
-The model is optional for `report --no-ai`. The data still come from MySQL, or
-from a saved snapshot only when `--snapshot` is supplied. A failed database
-read never silently switches to a saved file or test data.
-
-## Read these pieces first
-
-| Order | File and starting point | What to look for |
+| Step | Main code | What it does |
 | --- | --- | --- |
-| 1 | [pipeline.py](../loan_analyst/pipeline.py), `run_report` | The main steps and their order. Follow the named helpers as needed. |
-| 2 | [settings.py](../loan_analyst/settings.py), `Scenario` | The user's analysis choices and the rules that validate them. |
-| 3 | [analyses/common.py](../loan_analyst/analyses/common.py), `performance` | Which totals are used as denominators for each rate. |
-| 4 | [analyses/cutoffs.py](../loan_analyst/analyses/cutoffs.py), `analyze` and `facts` | How calculations become results and then sentences the model can cite. |
-| 5 | [tools.py](../loan_analyst/tools.py), `ToolOutput` and `ToolRegistry.call` | How named tools validate model arguments before running analysis code. |
-| 6 | [agent.py](../loan_analyst/agent.py), `Analyst.run` | Investigation followed by answer writing and validation. |
-| 7 | [tests/test_pipeline.py](../tests/test_pipeline.py) | Complete workflows with a fake database and scripted model. |
+| 1 | `workflow.run_report` | `OllamaClient.preflight()` checks the installed local model. |
+| 2 | `workflow.obtain_snapshot` -> `snapshot.read_snapshot` | Runs one grouped SELECT per table inside one read-only transaction, then saves the result. |
+| 3 | `calculations.build_registry` + `workflow.run_calls` | Runs the seven standard tool calls. An absent optional column is skipped. |
+| 4 | `workflow.build_report_evidence` | Copies settings, query text, results, facts and hashes into the evidence dict. Model calls are added later. |
+| 5 | `analyst.Analyst.run` | The model may call tools, then writes a JSON answer; Python validates every statement. |
+| 6 | `report.render_report` + `support.write_files` | Builds Markdown and stages all four files before replacing the old ones. |
 
-After that, read [cli.py](../loan_analyst/cli.py) for command routing,
-[cube.py](../loan_analyst/cube.py) for SQL and snapshots, and
-[report.py](../loan_analyst/report.py) for presentation. You do not need to
-understand the SQL builder before changing a report heading.
+## Read these files in this order
 
-## Know what each object holds
-
-| Name | Meaning | Where it lives |
+| Order | File | Read this first |
 | --- | --- | --- |
-| Grouped row | A dictionary containing group keys such as `period` and `score`, plus counts and sums. Its `rows` value counts source records; it is not one borrower record. | `cube.py` |
-| `Cube` | All grouped rows for one source, either accepted or rejected. It can select a cohort and collect rows into score bands. | `cube.py` |
-| `Snapshot` | Both cubes, source table information, query text, read timestamps and a content hash. Loading a saved snapshot verifies its hash and table names. | `cube.py` |
-| `Scenario` | Cutoffs, baseline, cohort dates, minimum outcome count, loss ceiling and any explicit expansion assumptions. | `settings.py` |
-| `ToolContext` | The snapshot and session scenario supplied by the application to an analysis tool. | `tools.py` |
-| `ToolOutput` | A title, a structured `result`, a dictionary of `facts`, and optional `highlights`. The result feeds tables; facts feed model citations. | `tools.py` |
-| `Ledger` | The collected facts and successful tool-call records. It assigns citation IDs such as `t1.scope`; definitions use IDs such as `def.loss_proxy`. | `evidence.py` |
-| `RunOptions` | Settings for one command: source, scenario, model, output folder and related choices. | `pipeline.py` |
-| `Services` | Replaceable access to external systems: database connections, model client, terminal input/output and a clock. Tests supply fakes here. | `pipeline.py` |
+| 1 | `loan_analyst/workflow.py` | `run_report`, then `run_ask` and `run_chat`. |
+| 2 | `loan_analyst/settings.py` | `Scenario` (the user's choices) and `DatabaseConfig`. The validation is a plain top-to-bottom `__init__`. |
+| 3 | `loan_analyst/snapshot.py` | `Cube.bands` (cohort + score bands) and `Snapshot` (the saved read). Skim `build_query`; the SQL is the hardest part. |
+| 4 | `loan_analyst/calculations.py` | One section at a time: shared rate rules, overview, cutoffs, segments, rejected applications. Each analysis has an `analyze_*` and an `*_facts`; the tool schemas and handlers are grouped at the end. |
+| 5 | `loan_analyst/report.py` | The tables and headings a reader sees. Each report section is a short function. |
+| 6 | `loan_analyst/analyst.py` | `Ledger`, `check_statement`, `validate_answer`, then `Analyst.run`. |
+| 7 | `tests/test_workflow.py` | Complete workflows with a fake connection and a scripted model. |
 
-Most data passed between these layers are ordinary dictionaries. For a result's
-exact fields, find the analysis function's return value and then its `facts`
-function. Avoid confusing a `ToolOutput.result` dictionary with the model's
-`answer`: one contains calculated data, the other contains statements and
-their evidence IDs.
+You do not need to understand the SQL builder before changing a report heading,
+and you do not need to understand evidence validation before changing a number.
+Keep those jobs separate.
 
-## Trace one report
+## Follow one number
 
-1. `__main__.py` calls `cli.main`. The CLI loads defaults, parses flags and builds
-   validated settings. It sends the `report` command to `pipeline.run_report`.
-2. When AI is enabled, the pipeline checks the local model before reading the
-   database. `obtain_snapshot` then loads an explicitly selected snapshot or
-   reads MySQL and immediately saves the new snapshot.
-3. For a live read, `read_snapshot` checks both tables before scanning either
-   one. Both scans share one read-only transaction. The transaction and
-   connection end before analysis begins.
-4. `toolbox` creates a registry of allowed tools, their context and a fact
-   ledger. `run_calls` executes `REPORT_CALLS`, the standard report analyses.
-   Missing optional grade or term segments can be skipped.
-5. Each tool returns a `ToolOutput`. `Ledger.record` stores the results and
-   gives the facts citation IDs. The report's initial results and facts become
-   the source evidence used to identify this run.
-6. `Analyst.run` lets the model request more tools, within configured round and
-   call limits. It then asks for a structured answer. The model receives fact
-   sentences, not grouped rows, SQL or connection settings.
-7. `validate_answer` checks references, numeric magnitudes and units, and
-   prohibited decision wording. There is at most one repair attempt. Remaining
-   invalid statements are withheld; an invalid main answer fails the run.
-   These checks do not establish that an interpretation is correct.
-8. `render_report` builds the Markdown. The pipeline writes `report.md`,
-   `aggregates.json`, `snapshot.json` and `ollama_analysis.json` only after the
-   analysis succeeds. A model failure leaves prior report files untouched; a
-   newly saved snapshot remains available for a rerun.
+The test fixture in `tests/fixtures.py` is a tiny snapshot: cohort starts
+2013-01, cutoffs are 600 and 700, and the baseline is 700. For cutoff 600:
 
-For `ask`, `pipeline.run_ask` starts with the same snapshot setup but initially
-runs only `describe_data`. The model chooses the analyses needed for the
-question. The validated answer is printed and saved as Markdown and JSON.
-`chat` reuses one snapshot and ledger across questions; `ChatSession` carries
-recent successful answers and their cited facts into the next turn.
+1. `Cube.bands` groups the rows into disjoint score bands. The `600` band holds
+   3 loans (score 640) and the `700` band holds 2 loans (score 712); there is
+   also a below-600 band and an invalid-score band.
+2. `compare_cutoffs` keeps every in-cohort band whose bucket is at least 600.
+   That is 3 + 2 = **5 retained loans** and $500 funded principal.
+3. `performance` uses only terminal loans: 4 are Fully Paid or Charged Off,
+   1 is Charged Off, so the charge-off rate is 1/4 = **25%**. Four loans have
+   complete financial fields, and they lost $80 on $400 of principal, so the
+   loss proxy is **20%**.
+4. `cutoff_facts` writes the sentence `accepted_600`, including `N/A` if a rate
+   was unavailable. The model may quote only that sentence.
+5. `report.cutoff_table` formats the same row for the Markdown table.
 
-## Understand a rate before changing it
+Try the test `test_cumulative_cutoffs_and_weighted_loss_denominator` in
+`tests/test_calculations.py`; it checks exactly these numbers.
 
-Accepted-loan metrics use different populations:
+Two rules matter more than any formula:
 
-| Metric | Numerator | Denominator |
+* **A missing value is `None`, never zero.** A rate without enough outcomes is
+  `N/A`. An open loan is not a zero-loss loan.
+* **Different rates use different populations.** Reads counts include open
+  loans; charge-off and loss rates use terminal loans only.
+
+## Follow one model answer
+
+1. `calculations.build_registry()` collects the five tools from the bottom of
+   `calculations.py`. Each tool is a name, a description, a JSON schema and a
+   handler.
+2. `Analyst.investigate` sends the model a short list of fact sentences and the
+   tool definitions. The model replies with a tool name and JSON arguments, or
+   with `DONE`.
+3. `ToolRegistry.call` looks up the name, validates the arguments against the
+   schema, runs the handler over the in-memory `Snapshot`, and returns a
+   `ToolOutput`.
+4. `Ledger.record` saves the result and gives every fact an ID such as
+   `t1.accepted_600`. Repeating the same call reuses the first ID.
+5. `Analyst.compose` asks for a JSON answer whose items cite those IDs.
+   `validate_answer` checks the structure, the IDs and every quoted number.
+   There is at most one repair attempt; invalid statements are withheld.
+6. `report.render_report` prints the validated statements with numbered
+   citations, and lists the original fact sentences under "Evidence cited".
+
+The checks prove that a number appears in a cited fact. They do **not** prove
+that the model's interpretation is right. That is why model text is labelled
+for review.
+
+## The objects worth knowing
+
+| Name | Where | What it means |
 | --- | --- | --- |
-| Terminal share | Fully Paid + Charged Off loans | All retained accepted loans |
-| Charge-off rate | Charged Off loans | Fully Paid + Charged Off loans |
-| Principal-loss proxy | Unrecovered principal on financially complete charged-off loans | Funded principal of all financially complete terminal loans |
-| Financial coverage | Financially complete terminal loans | All terminal loans |
+| `DatabaseConfig` | `settings.py` | Host, port, user and the two table names. Never contains a password. |
+| `Scenario` | `settings.py` | Cohort months, cutoffs, baseline, loss ceiling, minimum outcomes and optional expansion assumptions. Treat it as read-only; use `with_overrides()` to change one value. |
+| `ModelConfig` | `settings.py` | Loopback Ollama URL, model tag, timeouts and tool limits. |
+| `RunOptions` | `workflow.py` | One command's validated database + scenario + model + output folder. |
+| `Services` | `workflow.py` | Replaceable outside world: connection factory, model factory, clock, terminal input/output. Tests put fakes here. |
+| `Snapshot` | `snapshot.py` | Both grouped cubes, the SQL, read times and a content hash. A saved file is verified against that hash and the table names. |
+| `Cube` | `snapshot.py` | One source's grouped rows. `bands()` splits them by cohort status and score band. |
+| `ToolOutput` | `tools.py` | One calculation: a title, a structured `result`, citable `facts` and optional `highlights`. |
+| `Ledger` | `analyst.py` | Facts by ID plus the tool calls that produced them. |
+| Analysis artifact | `analyst.py` | The dict saved as `ollama_analysis.json`: requests, tool calls, validated answer, withheld statements, model digest and usage. |
 
-`performance` returns `None` when a rate is unavailable, including when its
-minimum outcome count is not met. `None` must not become zero. An open loan
-counts toward retained volume but not terminal loss outcomes. Missing financial
-data must not contribute an invented zero loss.
+Most data between these layers is a plain dictionary or list. When you need a
+result's exact fields, look at the `analyze_*` function that returns it.
 
-To see a small worked case, open `tests/fixtures.py` and the
-`test_cumulative_cutoffs_and_weighted_loss_denominator` test in
-`tests/test_analyses.py`. For its cohort and cutoff of 600, five loans are
-retained, four have complete terminal data, and the loss proxy is `80 / 400`,
-or 20%. The retained principal is 500, which is deliberately a different
-denominator. These fixtures are test inputs only.
+## What each output file is
 
-Rejected applications have no repayment outcomes. Their numeric score screens
-stay separate from accepted-loan performance; they are not additional observed
-loans or losses.
+| File | Contents |
+| --- | --- |
+| `report.md` | The human report: calculated tables, model commentary, evidence list, definitions. |
+| `aggregates.json` | Settings, snapshot provenance, every standard result and fact, run ID and source hash. |
+| `snapshot.json` | The grouped rows and SQL, reusable with `--snapshot <file>`. |
+| `ollama_analysis.json` | Exact model requests, tool definitions/calls, the validated answer, withheld statements and usage (or a disabled status). |
 
-## Find the right place for a change
+`aggregates.json` and `ollama_analysis.json` share one run ID and source hash.
+`render DIR` rebuilds `report.md` from them, so you can review wording without
+touching MySQL or the model.
 
-| Change | Start here | Verify with |
+## Where to make a change
+
+| Change | Start here | Test with |
 | --- | --- | --- |
-| A default or validation rule | `settings.py`, then the CLI/config entry points | `tests.test_settings`, `tests.test_pipeline` |
-| A formula or cutoff rule | The relevant module under `analyses/` | `tests.test_analyses` |
-| Report headings or formatting | `report.py`, or a table renderer in `analyses/` | `tests.test_pipeline` |
-| Model instructions | `prompts.py`; bump `VERSION` when editing prompts | `tests.test_agent`; live model checks separately when needed |
-| Evidence validation | `evidence.py` | `tests.test_evidence`, `tests.test_agent` |
-| SQL or snapshot structure | `cube.py`; connection behavior is in `db.py` | `tests.test_cube` |
-| A new analysis tool | A module under `analyses/` and `analyses.MODULES` | `tests.test_tools`, analysis-specific tests |
+| A default or validation rule | `settings.py` | `tests.test_settings`, `tests.test_workflow` |
+| A formula or cutoff rule | the matching `analyze_*` in `calculations.py` | `tests.test_calculations` |
+| A sentence the model may cite | the matching `*_facts` in `calculations.py` | `tests.test_calculations` |
+| A report heading or table column | `report.py` | `tests.test_workflow` |
+| Model instructions | `prompts.py` (bump `VERSION`) | `tests.test_analyst`; live model check separately |
+| Evidence or wording checks | `check_statement` / `validate_answer` in `analyst.py` | `tests.test_answer_checks`, `tests.test_analyst` |
+| SQL or snapshot structure | `snapshot.py`; connection handling in `database.py` | `tests.test_snapshot` |
+| A new tool | add the handler, schema and `Tool(...)` at the bottom of `calculations.py` | `tests.test_tools` |
 
-For a new analysis, follow an existing module: write a calculation function,
-turn its results into citable facts, and register a `Tool` with a schema and
-handler returning `ToolOutput`. Add a standard call to `pipeline.REPORT_CALLS`
-and a renderer to `report.SECTIONS` if it belongs in every report. Every number
-the model may quote must appear in a fact. Tool arguments cannot include SQL,
-paths, credentials, connection settings or expansion assumptions.
+For a new tool, follow an existing one exactly: write the calculation, turn every
+number the model may quote into a fact sentence, register a `Tool`, and (if it
+belongs in every report) add a call to `workflow.REPORT_CALLS` and a renderer to
+`report.SECTIONS`.
 
-Keep calculation changes separate from model wording changes when possible.
-A calculation can be verified directly without waiting for the model.
+## Run it without services
 
-## Work locally without services
-
-Run these from the repository root in PowerShell using the existing virtual
-environment:
+From the repository root in PowerShell:
 
 ```powershell
-# Read the commands and inspect the SQL/tool catalog without connecting:
+# Help and static information; no connections:
 .\.venv\Scripts\python.exe -m loan_analyst --help
 .\.venv\Scripts\python.exe -m loan_analyst sql
 .\.venv\Scripts\python.exe -m loan_analyst tools
 
-# Exercise the calculations and full workflows with test fixtures:
-.\.venv\Scripts\python.exe -m unittest tests.test_analyses -v
-.\.venv\Scripts\python.exe -m unittest tests.test_pipeline -v
-
-# Run the complete offline regression suite:
-.\.venv\Scripts\python.exe -m unittest discover -v
+# The whole offline regression suite (fakes only, no MySQL or Ollama):
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-`tests/fixtures.py` contains the reusable test helpers. `FakeConnection` records
-queries and transaction operations. `ScriptedModel` returns queued responses
-and records requests. `services(...)` puts those fakes into a `Services`
-instance and captures terminal output. Tests create temporary folders under
-`outputs/` and clean them up. This lets a workflow test check both its result
-and boundaries such as closing the connection before the analyst investigates.
+`tests/fixtures.py` holds the reusable helpers: `FakeConnection` records queries
+and transaction calls, `ScriptedModel` replays queued replies, and `services(...)`
+wires both into `Services` and captures terminal output. Tests create temporary
+folders under `outputs/` and remove them afterwards.
 
-`call`, `snapshot` and `report --no-ai` are not automatically offline commands:
-they can read MySQL. Use `--snapshot` explicitly when reusing an existing saved
-read. `ask` and `chat` still need the local model when using a saved snapshot.
-Passing the offline suite verifies code against fixtures; it does not verify
-current service availability or import completeness.
+`call`, `snapshot` and `report --no-ai` can read MySQL; use `--snapshot` when you
+only want to reuse a saved read. `ask` and `chat` still need the local model.
 
-The separate `import_csv_to_mysql.py` utility writes source data to MySQL and
-is outside the reporting path. Do not run an import to test a report change.
-Treat the source files under `data/` as read-only: that folder is a junction to
-the original dataset.
+## A short glossary
+
+| Term | Meaning |
+| --- | --- |
+| Cohort | The selected range of loan issue months (or rejected application months). |
+| Cutoff | A minimum score. "Retains" means historical loans at or above it. |
+| Score band | A disjoint range: below the first cutoff, between adjacent cutoffs, or at/above the last. |
+| Terminal loan | Exactly `Fully Paid` or `Charged Off`. Open, late and unknown statuses are excluded from rates. |
+| Terminal share | Terminal loans / all retained loans. |
+| Charge-off rate | Charged Off / terminal loans. |
+| Principal-loss proxy | Unrecovered principal on complete Charged Off loans / funded principal of all complete terminal loans. |
+| Financial coverage | Complete terminal loans / all terminal loans. Completeness, not credit quality. |
+| Evidence ID | A fact reference such as `def.loss_proxy` or `t1.accepted_600`. |
+| Expansion assumptions | Optional user-supplied hypothetical lending on rejected applications. Never measured outcomes. |
+
+## Why the files are grouped this way
+
+An earlier version split the same work across 23 small modules. Making one
+change meant jumping between `pipeline.py`, four modules under `analyses/`,
+`common.py`, `formatting.py`, `jsonutil.py` and `artifacts.py`. The code was
+correct but hard to read.
+
+The current layout keeps one subject per file:
+
+* calculations and their facts live together in `calculations.py`;
+* all human-readable output lives in `report.py`;
+* everything about the model lives in `analyst.py` + `prompts.py` + `ollama.py`;
+* the workflow is a numbered recipe in `workflow.py`.
+
+The files are longer, but each is a straight read from top to bottom. When a
+file gets too long to scan, use the section banners (`# ====`) and read only the
+section you need.
+
+Project constraints, live-validation history and the importer are documented in
+[`AGENTS.md`](../AGENTS.md). Operating commands are in [`README.md`](../README.md).

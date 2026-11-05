@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
-from loan_analyst import llm
+from loan_analyst import ollama as llm
 from loan_analyst.settings import ModelConfig
 
 

@@ -1,7 +1,7 @@
-"""Turn command-line input into validated settings, then call a workflow.
+"""Command line: turn arguments into validated settings, then call one workflow.
 
-Reading order: main() -> _options() -> the matching run_* function in pipeline.py.
-Argument groups below describe the CLI; calculations belong in analyses/.
+Reading order: main() -> _options() -> the matching run_* function in workflow.py.
+Calculations live in calculations.py; this file only parses and dispatches.
 Every command supports --help.
 """
 
@@ -10,13 +10,14 @@ import json
 import math
 import sys
 
-from .analyses import DEFINITIONS, build_registry
-from .cube import display_path
-from .pipeline import (RunOptions, Services, obtain_snapshot, preview_queries, run_ask, run_chat, run_render,
-                       run_report, toolbox)
+from .calculations import DEFINITIONS, build_registry
 from .report import DEFAULT_SECTIONS, check_sections
-from .settings import (DatabaseConfig, ModelConfig, Scenario, SettingsError, check_month, load_config,
-                       project_path)
+from .settings import (DatabaseConfig, ModelConfig, Scenario, SettingsError, check_month,
+                       load_config, project_path)
+from .support import display_path
+from .tools import ToolContext
+from .workflow import (RunOptions, Services, obtain_snapshot, preview_queries, run_ask,
+                       run_chat, run_render, run_report)
 
 DESCRIPTION = """Historical Lending Club score-cutoff analysis from MySQL, with a local tool-calling analyst.
 
@@ -75,7 +76,8 @@ def _add_database_arguments(parser, defaults):
 
 def _add_snapshot_argument(parser):
     parser.add_argument("--snapshot", metavar="PATH|latest",
-                        help="Reuse a saved MySQL snapshot instead of scanning: a snapshot JSON path, or 'latest'")
+                        help="Reuse a saved MySQL snapshot instead of scanning: a snapshot JSON path, "
+                             "or 'latest'")
 
 
 def _add_scenario_arguments(parser, defaults):
@@ -115,7 +117,8 @@ def _add_model_arguments(parser, defaults):
     group.add_argument("--num-ctx", type=positive_int, default=values.get("num_ctx", 16384),
                        help="Model context window in tokens; tool rounds need room (default %(default)s)")
     group.add_argument("--max-tool-rounds", type=int, default=values.get("max_tool_rounds", 4),
-                       help="Rounds in which the analyst may call tools; 0 only interprets (default %(default)s)")
+                       help="Rounds in which the analyst may call tools; 0 only interprets "
+                            "(default %(default)s)")
     group.add_argument("--max-tool-calls", type=positive_int, default=values.get("max_tool_calls", 8),
                        help="Total tool calls the analyst may make (default %(default)s)")
 
@@ -140,10 +143,13 @@ def build_parser(defaults=None):
     _add_scenario_arguments(report, defaults)
     _add_model_arguments(report, defaults)
     _add_output_argument(report, report_defaults.get("output_dir", "outputs/framework_report"))
-    report.add_argument("--sections", type=sections, default=report_defaults.get("sections", list(DEFAULT_SECTIONS)),
+    report.add_argument("--sections", type=sections,
+                        default=report_defaults.get("sections", list(DEFAULT_SECTIONS)),
                         help="Comma-separated report sections in order: " + ",".join(DEFAULT_SECTIONS))
-    report.add_argument("--no-ai", action="store_true", help="Explicitly write only the calculated MySQL report")
-    report.add_argument("--print-sql", action="store_true", help="Print the aggregate SQL without connecting")
+    report.add_argument("--no-ai", action="store_true",
+                        help="Explicitly write only the calculated MySQL report")
+    report.add_argument("--print-sql", action="store_true",
+                        help="Print the aggregate SQL without connecting")
 
     for name, help_text, folder in (("ask", "Answer one question with the tool-calling analyst", "outputs/ask"),
                                     ("chat", "Interactive analyst session", "outputs/chat")):
@@ -158,12 +164,14 @@ def build_parser(defaults=None):
 
     render = commands.add_parser("render", help="Re-render report.md from a report folder's saved artifacts")
     render.add_argument("directory", type=project_path, help="Report folder, e.g. outputs/framework_report")
-    render.add_argument("--sections", type=sections, default=report_defaults.get("sections", list(DEFAULT_SECTIONS)))
+    render.add_argument("--sections", type=sections,
+                        default=report_defaults.get("sections", list(DEFAULT_SECTIONS)))
 
     commands.add_parser("tools", help="Print the analyst's tool catalog as JSON")
     call = commands.add_parser("call", help="Run one tool and print JSON facts and results")
     call.add_argument("name", help="Tool name from the `tools` command")
-    call.add_argument("arguments", nargs="?", default="{}", help="JSON object, or '-' to read it from stdin")
+    call.add_argument("arguments", nargs="?", default="{}",
+                      help="JSON object, or '-' to read it from stdin")
     _add_database_arguments(call, defaults)
     _add_snapshot_argument(call)
     _add_scenario_arguments(call, defaults)
@@ -190,6 +198,7 @@ def _options(parser, args):
         # SQL preview and snapshot capture do not run any analysis.
         if not hasattr(args, "cutoffs"):
             return RunOptions(database=database, scenario=None)
+
         scenario = Scenario(
             cutoffs=args.cutoffs,
             baseline=args.baseline,
@@ -246,13 +255,21 @@ def _defaults(argv, services):
 
 def _call(options, args, services):
     snapshot = obtain_snapshot(options.database, options.snapshot, services)
-    registry, context, _ = toolbox(snapshot, options.scenario)
+    registry = build_registry()
+    context = ToolContext(snapshot, options.scenario)
+
     arguments = sys.stdin.read() if args.arguments == "-" else args.arguments
     envelope = registry.call(args.name, arguments, context)
     if envelope["ok"]:
         output = envelope["output"]
-        envelope = {"ok": True, "tool": envelope["tool"], "arguments": envelope["arguments"], "title": output.title,
-                    "facts": output.facts, "result": output.result}
+        envelope = {
+            "ok": True,
+            "tool": envelope["tool"],
+            "arguments": envelope["arguments"],
+            "title": output.title,
+            "facts": output.facts,
+            "result": output.result,
+        }
     services.out(json.dumps(envelope, indent=2, allow_nan=False))
     return 0 if envelope["ok"] else 1
 
@@ -261,17 +278,23 @@ def main(argv=None, services=None):
     """Parse input, dispatch one command, and return its process exit code."""
     services = services or Services()
     argv = list(sys.argv[1:] if argv is None else argv)
+
     try:
         defaults = _defaults(argv, services)
     except SettingsError as error:
         print(f"Configuration error: {error}", file=sys.stderr)
         return 2
+
     parser = build_parser(defaults)
     args = parser.parse_args(argv)
+
     if args.command == "tools":
-        services.out(json.dumps({"tools": build_registry().definitions(), "definitions": DEFINITIONS}, indent=2))
+        services.out(json.dumps({"tools": build_registry().definitions(), "definitions": DEFINITIONS},
+                                indent=2))
         return 0
+
     options = None if args.command == "render" else _options(parser, args)
+
     try:
         if args.command == "sql" or (args.command == "report" and args.print_sql):
             services.out(json.dumps(preview_queries(options.database), indent=2, allow_nan=False))

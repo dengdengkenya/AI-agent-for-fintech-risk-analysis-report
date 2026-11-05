@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from loan_analyst.analyses import build_registry
+from loan_analyst.calculations import build_registry
 from loan_analyst.tools import Tool, ToolContext, ToolOutput, ToolRegistry, object_schema
 from tests.fixtures import make_snapshot, scenario
 

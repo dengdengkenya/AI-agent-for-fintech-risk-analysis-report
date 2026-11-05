@@ -15,6 +15,24 @@ breakdown, vintages, grades or a loss-ceiling sweep, runs them, and writes
 findings. Every statement cites the facts it relies on, and Python checks the
 statements before anything is shown.
 
+## Code layout
+
+The package is grouped by subject, not split into many tiny modules. Start at
+`workflow.run_report`; its six numbered comments are the whole program. A plain
+reading order is:
+
+| File | What it holds |
+| --- | --- |
+| `loan_analyst/workflow.py` | report / ask / chat / render, top to bottom |
+| `loan_analyst/settings.py` | the user's validated choices |
+| `loan_analyst/snapshot.py` | grouped SQL, `Cube` and `Snapshot` |
+| `loan_analyst/calculations.py` | every number in the report and the model's tools |
+| `loan_analyst/report.py` | every table and heading a reader sees |
+| `loan_analyst/analyst.py` | covered facts, answer checks and the model loop |
+
+The [developer guide](docs/DEVELOPER_GUIDE.md) explains the flow with a worked
+example and a glossary. You do not need MySQL or Ollama to read or test it.
+
 ## Quick start
 
 Run from this project in PowerShell. MySQL 8.0+ and local Ollama must be running.
@@ -207,11 +225,12 @@ results.
 
 ## Customizing and extending
 
-The `loan_analyst/` package is split so that each piece changes independently:
-add an analysis module and it becomes a tool for the analyst, a `call` command
-and (with a renderer) a report section; add a segment column in one place;
-reorder report sections with a flag; swap the model client or database
-connection through `Services`. See "Extending" in `AGENTS.md`.
+The package keeps one subject per file, so a change usually stays in one place:
+add a calculation and a `Tool` at the bottom of `calculations.py`; add a table or
+heading to `report.py`; change the report order with `--sections`; change model
+wording in `prompts.py`; swap the database connection or model client through
+`workflow.Services`. See "Extending" in `AGENTS.md` and the
+[developer guide](docs/DEVELOPER_GUIDE.md).
 
 ## Importing real source data separately
 
@@ -242,7 +261,7 @@ leave that batch's outcome uncertain. Table creation commits separately.
 
 ```powershell
 # Offline tests; no running services or credentials needed:
-.\.venv\Scripts\python.exe -m unittest discover -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 Unit tests use isolated fixtures and fake services only inside `tests/`; those

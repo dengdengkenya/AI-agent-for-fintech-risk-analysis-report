@@ -8,10 +8,9 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from loan_analyst import PROJECT_ROOT, cli
-from loan_analyst.analyses import cutoffs
-from loan_analyst.cube import Snapshot, save_snapshot
-from loan_analyst.llm import ModelError
+from loan_analyst import PROJECT_ROOT, calculations, cli
+from loan_analyst.snapshot import Snapshot, save_snapshot
+from loan_analyst.ollama import ModelError
 from loan_analyst.settings import ModelConfig
 from tests.fixtures import (FakeConnection, ScriptedModel, calls, done, grounded, make_snapshot, scenario, services,
                             statement, temporary_directory)
@@ -27,7 +26,7 @@ class MissingModel:
         raise ModelError(f"{ModelConfig.model} is not installed locally")
 
 
-class PipelineTests(unittest.TestCase):
+class WorkflowTests(unittest.TestCase):
     def run_cli(self, argv, wired):
         stderr = io.StringIO()
         with redirect_stderr(stderr):
@@ -62,7 +61,7 @@ class PipelineTests(unittest.TestCase):
         compare = next(call for call in evidence["calls"] if call["tool"] == "compare_score_cutoffs")
         self.assertEqual(compare["result"]["candidate_cutoff"], 600)
         snapshot = Snapshot.from_payload(self.read(folder, "snapshot.json"), "test")
-        self.assertEqual(compare["result"], cutoffs.analyze(snapshot, scenario(max_loss_rate=.25)))
+        self.assertEqual(compare["result"], calculations.compare_cutoffs(snapshot, scenario(max_loss_rate=.25)))
         self.assertIn("`custom_loans`.`loan_inputs`", evidence["queries"]["accepted"])
         self.assertEqual((analysis["run_id"], analysis["source_evidence_sha256"]),
                          (evidence["run_id"], evidence["source_evidence_sha256"]))

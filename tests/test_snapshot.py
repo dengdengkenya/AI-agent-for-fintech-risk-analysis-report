@@ -6,9 +6,9 @@ from types import ModuleType
 import unittest
 from unittest.mock import Mock, patch
 
-from loan_analyst import db
-from loan_analyst.cube import (ACCEPTED, DIMENSIONS, REJECTED, REQUIRED, SchemaError, Snapshot, build_query,
-                               load_snapshot, read_snapshot, save_snapshot)
+from loan_analyst import database as db
+from loan_analyst.snapshot import (ACCEPTED, DIMENSIONS, REJECTED, REQUIRED, SchemaError, Snapshot, build_query,
+                                   load_snapshot, read_snapshot, save_snapshot)
 from loan_analyst.settings import DatabaseConfig
 from tests.fixtures import FakeConnection, cube_rows, make_snapshot, temporary_directory
 

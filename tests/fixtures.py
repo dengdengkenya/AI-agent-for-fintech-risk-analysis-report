@@ -10,8 +10,8 @@ from pathlib import Path
 import tempfile
 
 from loan_analyst import PROJECT_ROOT
-from loan_analyst.cube import ACCEPTED, REJECTED, REQUIRED, Cube, Snapshot
-from loan_analyst.pipeline import Services
+from loan_analyst.snapshot import ACCEPTED, REJECTED, REQUIRED, Cube, Snapshot
+from loan_analyst.workflow import Services
 from loan_analyst.settings import ModelConfig, Scenario
 
 OPTIONAL = {ACCEPTED: {"grade", "term"}, REJECTED: set()}
@@ -56,8 +56,8 @@ def make_snapshot(rows=None, dimensions=("grade", "term")):
     sources = {ACCEPTED: {"table": "accepted", "engine": "InnoDB", "dimensions": list(dimensions)},
                REJECTED: {"table": "rejected", "engine": "InnoDB", "dimensions": []}}
     cubes = {kind: Cube(kind, sources[kind]["dimensions"], rows[kind]) for kind in rows}
-    return Snapshot.create("demo", sources, {ACCEPTED: "-- accepted SQL", REJECTED: "-- rejected SQL"}, cubes,
-                           "2026-11-03T10:00:00+00:00", "2026-11-03T10:04:00+00:00")
+    return Snapshot("demo", sources, {ACCEPTED: "-- accepted SQL", REJECTED: "-- rejected SQL"}, cubes,
+                    "2026-11-03T10:00:00+00:00", "2026-11-03T10:04:00+00:00")
 
 
 class FakeCursor:

@@ -2,7 +2,7 @@
 
 import unittest
 
-from loan_analyst.evidence import Ledger, answer_schema, check_statement, numeric_tokens, validate_answer
+from loan_analyst.analyst import Ledger, answer_schema, check_statement, numeric_tokens, validate_answer
 from loan_analyst.tools import ToolOutput
 
 FACTS = {"t1.loss": "Loss proxy 13.80%; funded amount $34,000,792,025.",

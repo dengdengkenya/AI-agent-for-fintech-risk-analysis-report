@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from loan_analyst.analyses import cutoffs, overview, rejected, segments
+from loan_analyst import calculations, report
 from loan_analyst.tools import ToolUnavailable
 from tests.fixtures import cube_rows, make_snapshot, scenario
 
@@ -13,7 +13,7 @@ class CutoffTests(unittest.TestCase):
         self.snapshot = make_snapshot()
 
     def compare(self, **changes):
-        return cutoffs.analyze(self.snapshot, scenario(**changes))
+        return calculations.compare_cutoffs(self.snapshot, scenario(**changes))
 
     def test_cumulative_cutoffs_and_weighted_loss_denominator(self):
         lower, baseline = self.compare()["scenarios"]
@@ -64,8 +64,8 @@ class CutoffTests(unittest.TestCase):
         sparse = self.compare(min_outcomes=5)
         self.assertTrue(all(row["loss_rate"] is None and row["chargeoff_rate"] is None
                             for row in sparse["scenarios"]))
-        self.assertIn("N/A", cutoffs.cutoff_table(sparse, scenario(min_outcomes=5)))
-        self.assertIn("No tested cutoff has enough", cutoffs.glance(sparse, scenario(min_outcomes=5)))
+        self.assertIn("N/A", report.cutoff_table(sparse, scenario(min_outcomes=5)))
+        self.assertIn("No tested cutoff has enough", report.cutoff_glance(sparse, scenario(min_outcomes=5)))
 
     def test_candidate_requires_ceiling_and_complete_financial_coverage(self):
         self.assertIsNone(self.compare()["candidate_cutoff"])
@@ -77,21 +77,21 @@ class CutoffTests(unittest.TestCase):
         self.assertIsNone(self.compare(max_loss_rate=.25)["candidate_cutoff"])
 
     def test_sweep_moves_the_candidate_with_the_ceiling(self):
-        result = cutoffs.sweep(self.snapshot, scenario(max_loss_rate=.01), [.3, .1, .1])
+        result = calculations.sweep_loss_ceilings(self.snapshot, scenario(max_loss_rate=.01), [.3, .1, .1])
         self.assertEqual([(row["ceiling"], row["candidate_cutoff"]) for row in result["ceilings"]],
                          [(.1, 700), (.3, 600)])
-        facts = cutoffs.sweep_facts(result, scenario())
+        facts = calculations.sweep_facts(result, scenario())
         self.assertIn("candidate cutoff 600 retains 5 accepted loans", facts["ceiling_2"])
         rows = cube_rows()
         rows["accepted"][1]["terminal_rows"] = 3
-        none = cutoffs.sweep(make_snapshot(rows), scenario(), [.5])
-        self.assertIn("no tested cutoff qualifies", cutoffs.sweep_facts(none, scenario())["ceiling_1"])
+        none = calculations.sweep_loss_ceilings(make_snapshot(rows), scenario(), [.5])
+        self.assertIn("no tested cutoff qualifies", calculations.sweep_facts(none, scenario())["ceiling_1"])
 
     def test_facts_keep_unavailable_values_and_only_explicit_fields(self):
         result = self.compare()
         result["password"] = result["scenarios"][0]["borrower"] = "private-marker"
         result["scenarios"][0]["loss_rate"] = None
-        facts = cutoffs.facts(result, scenario())
+        facts = calculations.cutoff_facts(result, scenario())
         self.assertIn("principal-loss proxy N/A", facts["accepted_600"])
         self.assertIn("no cutoff is selected", facts["selection"])
         self.assertNotIn("private-marker", json.dumps(facts))
@@ -100,7 +100,7 @@ class CutoffTests(unittest.TestCase):
     def test_comparison_facts_separate_loss_from_financial_completeness(self):
         result = self.compare(baseline=600)
         result["scenarios"][-1]["loss_data_coverage"] = .8
-        facts = cutoffs.facts(result, scenario(baseline=600))
+        facts = calculations.cutoff_facts(result, scenario(baseline=600))
         self.assertIn("fewer accepted loans", facts["comparison_high"])
         self.assertIn("loss proxy is lower", facts["comparison_high"])
         self.assertIn("coverage at the highest cutoff is lower", facts["comparison_coverage"])
@@ -109,33 +109,36 @@ class CutoffTests(unittest.TestCase):
     def test_near_equal_loss_and_empty_cohort_are_not_meaningful_changes(self):
         result = self.compare()
         result["scenarios"][0]["loss_rate_change_pp"] = .0001
-        self.assertIn("unchanged at the displayed precision", cutoffs.facts(result, scenario())["comparison_low"])
+        self.assertIn("unchanged at the displayed precision",
+                      calculations.cutoff_facts(result, scenario())["comparison_low"])
         empty_scenario = scenario(start_month="2030-01")
-        facts = cutoffs.facts(cutoffs.analyze(self.snapshot, empty_scenario), empty_scenario)
+        facts = calculations.cutoff_facts(calculations.compare_cutoffs(self.snapshot, empty_scenario),
+                                          empty_scenario)
         self.assertIn("unavailable", facts["comparison_high"])
         self.assertIn("unavailable", facts["comparison_coverage"])
 
     def test_hypothetical_inputs_are_labelled_as_assumptions(self):
         assumed = scenario(assume_comparable_scores=True, rejected_loss_rate=.15, take_up_rate=.25)
-        result = cutoffs.analyze(self.snapshot, assumed)
-        self.assertIn("not measured outcomes", cutoffs.facts(result, assumed)["hypothetical_inputs"])
-        self.assertIn("hypothetical_inputs", cutoffs.highlights(result, assumed))
-        self.assertIn("Explicit hypothetical expansion", cutoffs.rejected_screen(result, assumed))
+        result = calculations.compare_cutoffs(self.snapshot, assumed)
+        self.assertIn("not measured outcomes", calculations.cutoff_facts(result, assumed)["hypothetical_inputs"])
+        self.assertIn("hypothetical_inputs", calculations.cutoff_highlights(result, assumed))
+        self.assertIn("Explicit hypothetical expansion", report.rejected_screen(result, assumed))
 
 
 class OverviewTests(unittest.TestCase):
     def test_overview_describes_sources_and_cohort_exclusions(self):
-        result = overview.analyze(make_snapshot(), scenario())
+        result = calculations.analyze_overview(make_snapshot(), scenario())
         self.assertEqual(result["sources"]["accepted"]["total_rows"], 34)
         self.assertEqual((result["sources"]["accepted"]["first_month"], result["sources"]["accepted"]["last_month"]),
                          ("2012-06", "2016-01"))
-        facts = overview.facts(result, scenario())
+        facts = calculations.overview_facts(result)
         self.assertIn("optional segments: grade, term", facts["source_accepted"])
         self.assertIn("invalid scores", facts["quality_accepted"])
         self.assertIn("invalid-amount exclusions are 20.0000%", facts["quality_comparison"])
         self.assertIn("do not distinguish these reasons", facts["quality_comparison"])
         self.assertIn("not the repayment observation date", facts["snapshot"])
-        empty = overview.facts(overview.analyze(make_snapshot(), scenario(start_month="2030-01")), scenario())
+        empty = calculations.overview_facts(
+            calculations.analyze_overview(make_snapshot(), scenario(start_month="2030-01")))
         self.assertIn("unavailable", empty["quality_comparison"])
 
 
@@ -144,7 +147,7 @@ class SegmentTests(unittest.TestCase):
         self.snapshot = make_snapshot()
 
     def segments(self, dimension, **options):
-        return segments.analyze(self.snapshot, scenario(), dimension, **options)
+        return calculations.analyze_segments(self.snapshot, scenario(), dimension, **options)
 
     def test_score_bands_show_the_loans_each_cutoff_step_removes(self):
         result = self.segments("score_band")
@@ -153,16 +156,16 @@ class SegmentTests(unittest.TestCase):
         band = result["segments"][1]
         self.assertAlmostEqual(band["loss_rate"], .4)
         self.assertAlmostEqual(sum(item["loan_share"] for item in result["segments"]), 1)
-        facts = segments.facts(result)
+        facts = calculations.segment_facts(result)
         self.assertIn("highest principal-loss proxy is 600-699 at 40.00%", facts["loss_range"])
-        self.assertEqual(set(segments.highlights(result, facts)), set(facts))
+        self.assertEqual(set(calculations.segment_highlights(result, facts)), set(facts))
 
     def test_issue_years_report_seasoning(self):
         result = self.segments("issue_year")
         self.assertEqual([item["segment"] for item in result["segments"]], ["2014", "2015", "2016"])
-        facts = segments.facts(result)
+        facts = calculations.segment_facts(result)
         self.assertIn("ranges from 0.00% (issue year 2014) to 80.00% (issue year 2015)", facts["seasoning"])
-        self.assertEqual(segments.highlights(result, facts), ("scope", "seasoning"))
+        self.assertEqual(calculations.segment_highlights(result, facts), ("scope", "seasoning"))
 
     def test_grade_and_term_segments_and_score_filter(self):
         grades = self.segments("grade")
@@ -170,18 +173,18 @@ class SegmentTests(unittest.TestCase):
         terms = self.segments("term", min_score=600)
         self.assertEqual([(item["segment"], item["accepted"]["rows"]) for item in terms["segments"]],
                          [("36 months", 5)])
-        self.assertIn("score at or above 600", segments.facts(terms)["scope"])
+        self.assertIn("score at or above 600", calculations.segment_facts(terms)["scope"])
 
     def test_missing_optional_columns_are_reported_as_unavailable(self):
         snapshot = make_snapshot(dimensions=("term",))
         with self.assertRaises(ToolUnavailable):
-            segments.analyze(snapshot, scenario(), "grade")
-        self.assertTrue(segments.analyze(snapshot, scenario(), "term")["segments"])
+            calculations.analyze_segments(snapshot, scenario(), "grade")
+        self.assertTrue(calculations.analyze_segments(snapshot, scenario(), "term")["segments"])
 
 
 class RejectedTests(unittest.TestCase):
     def test_score_eras_keep_fico_and_vantagescore_apart(self):
-        result = rejected.analyze(make_snapshot(), scenario())
+        result = calculations.analyze_rejected(make_snapshot(), scenario())
         groups = {group["group"]: group for group in result["groups"]}
         fico, vantage = groups["FICO era (before 2013-11)"], groups["VantageScore era (after 2013-11)"]
         self.assertEqual((fico["rows"], vantage["rows"]), (4, 1))
@@ -189,11 +192,11 @@ class RejectedTests(unittest.TestCase):
                   for group in groups}
         self.assertEqual(at_700["VantageScore era (after 2013-11)"]["amount_sum"], 400)
         self.assertEqual(at_700["FICO era (before 2013-11)"]["rows"], 0)
-        facts = rejected.facts(result)
+        facts = calculations.rejected_facts(result)
         self.assertIn("not comparable to accepted FICO", facts["scope"])
-        years = rejected.analyze(make_snapshot(), scenario(), by="application_year")
+        years = calculations.analyze_rejected(make_snapshot(), scenario(), by="application_year")
         self.assertEqual([group["group"] for group in years["groups"]], ["2013", "2015"])
-        self.assertEqual(rejected.era("2013-11"), "transition")
+        self.assertEqual(calculations.era("2013-11"), "transition")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 ## Project status
 
-Last updated: 2026-11-04.
+Last updated: 2026-11-05.
 
 This project generates historical Lending Club reports from existing MySQL
 accepted/rejected tables. A local Ollama/Qwen analyst investigates the results by
@@ -14,20 +14,22 @@ its imported loan tables synthetic.
 `CLAUDE.md` is a relative symbolic link to `AGENTS.md`. Edit `AGENTS.md` to update
 the shared instructions; preserve the link rather than creating a second copy.
 
-The code is the `loan_analyst/` package. Each layer can be used or replaced alone:
+The code is the `loan_analyst/` package. It is grouped by subject rather than
+split into many tiny modules, so one change usually stays in one file:
 
 | Path | Purpose |
 | --- | --- |
 | `loan_analyst/cli.py`, `__main__.py` | Command line: `python -m loan_analyst report \| ask \| chat \| render \| tools \| call \| sql \| snapshot`. |
-| `loan_analyst/pipeline.py` | Workflows built from small steps and injectable `Services` (connections, model client, clock, terminal I/O). |
-| `loan_analyst/settings.py` | Validated `DatabaseConfig`, `Scenario`, `ModelConfig`; TOML defaults (see `loan_analyst.example.toml`). |
-| `loan_analyst/db.py` | Credentials, connections, read-only transactions and table metadata; knows nothing about loans. |
-| `loan_analyst/cube.py` | Grouped snapshot SQL, `Cube`/`Snapshot`, cohort and band selection, snapshot files. |
-| `loan_analyst/analyses/` | Analysis plug-ins (`overview`, `cutoffs`, `segments`, `rejected`), each with tools, facts and report tables; `definitions.py` holds citable domain definitions. |
-| `loan_analyst/tools.py` | Tool registry: JSON schemas, argument validation and sanitized dispatch. |
-| `loan_analyst/evidence.py` | Fact ledger and validation of model statements against cited facts. |
-| `loan_analyst/llm.py`, `agent.py`, `prompts.py` | Loopback Ollama client, the tool-calling analyst loop, and editable prompts. |
-| `loan_analyst/report.py` | Composable report sections and answer rendering. |
+| `loan_analyst/workflow.py` | The four workflows (`run_report`, `run_ask`, `run_chat`, `run_render`), `Services`, `RunOptions` and `REPORT_CALLS`. Start here. |
+| `loan_analyst/settings.py` | Plain-class `DatabaseConfig`, `Scenario`, `ModelConfig` with top-to-bottom validation; TOML loading (see `loan_analyst.example.toml`). |
+| `loan_analyst/database.py` | Credentials, connections, read-only transactions and table metadata; knows nothing about loans. |
+| `loan_analyst/snapshot.py` | Grouped snapshot SQL, `Cube`/`Snapshot`, cohort and band selection, snapshot files. |
+| `loan_analyst/calculations.py` | Every analysis and its citable facts: overview, cutoffs, segments, rejected applications; the tool schemas/handlers at the bottom; `DEFINITIONS`. |
+| `loan_analyst/tools.py` | Tool model, JSON-schema argument validation and sanitized dispatch. |
+| `loan_analyst/analyst.py` | Fact `Ledger`, statement validation, the tool-calling `Analyst` loop and `ChatSession`. |
+| `loan_analyst/ollama.py`, `prompts.py` | Loopback Ollama HTTP client, and the editable prompt text. |
+| `loan_analyst/report.py` | All Markdown tables, report sections and answer rendering. |
+| `loan_analyst/support.py` | Shared JSON, number formatting, atomic file writing and path helpers. |
 | `generate_framework_report.py` | Compatibility entry point, equal to `python -m loan_analyst report`. |
 | `import_csv_to_mysql.py` | Separate streaming administrative importer for the real CSV sources; supports `--dry-run`. |
 | `tests/` | Offline regression tests; fixtures and fake database/model services are confined to tests. |
@@ -35,7 +37,8 @@ The code is the `loan_analyst/` package. Each layer can be used or replaced alon
 For a guided reading order, a worked calculation and common change locations, see
 [`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md). Keep the main workflows easy
 to follow: use descriptive names, explicit calculation steps and comments that
-explain domain rules or safety boundaries.
+explain domain rules or safety boundaries. Prefer a clear loop in a cohesive file
+over another layer of one-line helpers.
 
 On 2026-11-03 the former `score_cutoff_*.py` modules, `ollama_analysis.py` and
 `score_cutoff_tool_dictionary.json` were folded into the package;
@@ -43,9 +46,20 @@ On 2026-11-03 the former `score_cutoff_*.py` modules, `ollama_analysis.py` and
 reintroduce demo sources or silently use saved/synthetic aggregates when a
 database query fails.
 
-Verified on 2026-11-04: 87 offline tests pass (Python 3.13.7 on Windows).
-The user's live grouped read completed in 396.4s and saved snapshot
-`20261104T010032Z-4dbb63a3`: `demo.accepted` 2,260,669 rows and `demo.rejected`
+On 2026-11-05 the package was consolidated from 23 small modules into the files
+above (`pipeline` -> `workflow`, `db` -> `database`, `cube` -> `snapshot`,
+`analyses/*` -> `calculations`, `evidence` + `agent` -> `analyst`, `llm` ->
+`ollama`, `formatting` + `jsonutil` + `artifacts` -> `support`). Report rendering
+moved out of the analysis modules into `report.py`. The offline behavior capture
+(artifacts, model requests, SQL, transactions and logs) was byte-identical to
+the pre-consolidation code after normalizing temporary folder names.
+
+Verified on 2026-11-05: 87 offline tests pass (Python 3.13.7 on Windows), and a
+behavior capture of `report`, `report --no-ai`, `ask`, `chat`, `repair`,
+`render`, `tools` and `sql` was byte-identical to the pre-consolidation code
+(after normalizing temporary folder names). The live grouped read below was
+completed on 2026-11-04 and was not repeated for this refactor. It took 396.4s
+and saved snapshot `20261104T010032Z-4dbb63a3`: `demo.accepted` 2,260,669 rows and `demo.rejected`
 27,648,741 rows. Its content hash was verified locally. The subsequent model
 failure was reproduced from that snapshot: `qwen3:4b` resolved to Qwen3 4B
 Thinking 2507 and stopped with `done_reason=length` after 1,024 generated tokens.
@@ -71,7 +85,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 # All offline regression tests; no services or credentials needed:
-.\.venv\Scripts\python.exe -m unittest discover -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
 # SQL preview; no database/model connection or output writes:
 .\.venv\Scripts\python.exe -m loan_analyst sql
@@ -124,11 +138,11 @@ complete/deduplicated import.
   A token-limit response is discarded before any partial tool call can execute.
 - Endpoint must be loopback HTTP. Disable proxies and redirects; reject cloud
   models. Never fall back to an external AI service.
-- The model may call only tools registered by `loan_analyst/analyses`; `tools.py`
-  validates arguments against their schemas before execution. Tools compute over
-  the in-memory snapshot, cannot reach MySQL, and accept no SQL, credentials,
-  hosts, table names, paths or expansion assumptions. The model receives fact
-  sentences only, never cube rows, SQL or connection settings.
+- The model may call only the tools built by `calculations.build_registry`;
+  `tools.py` validates arguments against their schemas before execution. Tools
+  compute over the in-memory snapshot, cannot reach MySQL, and accept no SQL,
+  credentials, hosts, table names, paths or expansion assumptions. The model
+  receives fact sentences only, never cube rows, SQL or connection settings.
 - Every model statement cites fact IDs (`def.*`, `t<n>.*`). Numeric magnitudes and
   units in prose must appear in its cited facts, and accept/reject/approve/deny
   wording is refused. After one repair attempt, statements that still fail are
@@ -157,20 +171,21 @@ complete/deduplicated import.
 
 ## Extending
 
-- New analysis: add a module under `loan_analyst/analyses/` with pure
-  `analyze`/`facts` functions and a `TOOLS` tuple of `tools.Tool` (JSON schema
-  plus a handler returning `ToolOutput`), then list it in `analyses.MODULES`.
-  Write every number the model may quote into a fact.
-- New segment column: add a validated `Dimension` to `cube.DIMENSIONS` and a
-  grouping in `analyses/segments.py`.
+- New analysis: add an `analyze_*` function and an `*_facts` function to
+  `calculations.py`, then register a `tools.Tool` (JSON schema plus a handler
+  returning `ToolOutput`) in that file's `TOOLS` tuple. Write every number the
+  model may quote into a fact. Add a standard call to `workflow.REPORT_CALLS` and
+  a renderer to `report.SECTIONS` if it belongs in every report.
+- New segment column: add a validated `Dimension` to `snapshot.DIMENSIONS` and a
+  grouping branch in `calculations.analyze_segments`.
 - Report layout: reorder or drop sections with `--sections` or the `[report]`
-  config table; add renderers to `report.SECTIONS` and deterministic steps to
-  `pipeline.REPORT_CALLS`.
+  config table; renderers are in `report.SECTIONS`, deterministic steps in
+  `workflow.REPORT_CALLS`.
 - Wording: prompts live in `prompts.py` (bump `VERSION` when changing them) and
-  citable definitions in `analyses/definitions.py`.
+  citable definitions in `calculations.DEFINITIONS`.
 - Another local model server: pass any object with `preflight()` and
-  `chat(messages, tools=, format=, num_predict=)` through `Services.model_factory`.
-  It must stay loopback-only.
+  `chat(messages, tools=, format=, num_predict=)` through
+  `workflow.Services.model_factory`. It must stay loopback-only.
 
 ## Source data and importer safeguards
 
