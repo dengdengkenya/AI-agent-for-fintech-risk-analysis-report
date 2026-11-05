@@ -3,17 +3,20 @@
 A Tool pairs a JSON schema with a host handler. The model chooses a registered name and
 JSON arguments; the host validates them and runs the handler over the in-memory
 snapshot, returning citable facts. No tool accepts SQL, credentials, table names or
-paths, and no tool can reach MySQL: the snapshot was read before the model was involved.
+paths, and no tool can reach MySQL: the snapshot was read before the analyst starts
+requesting tools.
 """
 
 from copy import deepcopy
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import math
 import re
 
 from .jsonutil import read_json
-from .settings import SettingsError
+from .cube import Snapshot
+from .settings import Scenario, SettingsError
 
 
 class ArgumentError(ValueError):
@@ -26,20 +29,25 @@ class ToolUnavailable(LookupError):
 
 @dataclass(frozen=True)
 class ToolOutput:
-    """A tool's answer: a short title, a JSON-safe result and citable fact sentences."""
+    """One calculation, presented for two readers.
+
+    Report renderers use the structured result. The model sees only fact sentences,
+    keyed by local names such as "coverage". Ledger.record() adds a call prefix
+    (for example, "t1.coverage") so the model can cite each sentence uniquely.
+    """
 
     title: str
     result: dict
-    facts: dict
-    highlights: tuple = ()  # fact keys worth preloading into a report-writing prompt
+    facts: dict[str, str]
+    highlights: tuple[str, ...] = ()  # fact keys worth preloading into a report-writing prompt
 
 
 @dataclass(frozen=True)
 class ToolContext:
     """Host-controlled inputs shared by every call: the snapshot and session scenario."""
 
-    snapshot: object
-    scenario: object
+    snapshot: Snapshot
+    scenario: Scenario
 
 
 @dataclass(frozen=True)
@@ -47,7 +55,7 @@ class Tool:
     name: str
     description: str
     parameters: dict
-    handler: object  # callable(context, **arguments) -> ToolOutput
+    handler: Callable[..., ToolOutput]  # called as handler(context, **arguments)
 
     def definition(self):
         return {"type": "function", "function": {
@@ -102,7 +110,7 @@ def _validate_value(name, value, schema):
             _validate_value(f"{name} item", item, schema["items"])
 
 
-def validate_arguments(schema, arguments):
+def validate_arguments(schema: dict, arguments: object) -> dict:
     """Return only supplied, valid arguments; omitted ones fall back to session settings."""
     if not isinstance(arguments, dict):
         raise ArgumentError("Tool arguments must be a JSON object")

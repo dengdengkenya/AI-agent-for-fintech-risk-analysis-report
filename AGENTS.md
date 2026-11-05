@@ -32,6 +32,11 @@ The code is the `loan_analyst/` package. Each layer can be used or replaced alon
 | `import_csv_to_mysql.py` | Separate streaming administrative importer for the real CSV sources; supports `--dry-run`. |
 | `tests/` | Offline regression tests; fixtures and fake database/model services are confined to tests. |
 
+For a guided reading order, a worked calculation and common change locations, see
+[`docs/DEVELOPER_GUIDE.md`](docs/DEVELOPER_GUIDE.md). Keep the main workflows easy
+to follow: use descriptive names, explicit calculation steps and comments that
+explain domain rules or safety boundaries.
+
 On 2026-11-03 the former `score_cutoff_*.py` modules, `ollama_analysis.py` and
 `score_cutoff_tool_dictionary.json` were folded into the package;
 `python -m loan_analyst tools` prints the generated tool catalog. Do not

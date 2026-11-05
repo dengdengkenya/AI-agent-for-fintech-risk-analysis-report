@@ -1,4 +1,9 @@
-"""Command line: python -m loan_analyst <command> [options]. Every command has --help."""
+"""Turn command-line input into validated settings, then call a workflow.
+
+Reading order: main() -> _options() -> the matching run_* function in pipeline.py.
+Argument groups below describe the CLI; calculations belong in analyses/.
+Every command supports --help.
+"""
 
 import argparse
 import json
@@ -55,7 +60,7 @@ def sections(value):
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-def _database(parser, defaults):
+def _add_database_arguments(parser, defaults):
     values = defaults.get("database", {})
     group = parser.add_argument_group("MySQL source (password from MYSQL_PASSWORD or a terminal prompt)")
     group.add_argument("--host", default=values.get("host", "localhost"))
@@ -68,12 +73,12 @@ def _database(parser, defaults):
                        help="Maximum seconds per aggregate SELECT (default %(default)s)")
 
 
-def _snapshot(parser):
+def _add_snapshot_argument(parser):
     parser.add_argument("--snapshot", metavar="PATH|latest",
                         help="Reuse a saved MySQL snapshot instead of scanning: a snapshot JSON path, or 'latest'")
 
 
-def _scenario(parser, defaults):
+def _add_scenario_arguments(parser, defaults):
     values = defaults.get("scenario", {})
     group = parser.add_argument_group("scenario (defaults for every analysis; the analyst may vary cohort, "
                                       "cutoffs and ceiling)")
@@ -97,7 +102,7 @@ def _scenario(parser, defaults):
                        help="Assumed share of screened rejected demand funded (default 1)")
 
 
-def _model(parser, defaults):
+def _add_model_arguments(parser, defaults):
     values = defaults.get("model", {})
     group = parser.add_argument_group("local model (loopback Ollama only)")
     group.add_argument("--ollama-url", default=values.get("url", "http://localhost:11434"))
@@ -115,12 +120,13 @@ def _model(parser, defaults):
                        help="Total tool calls the analyst may make (default %(default)s)")
 
 
-def _output(parser, default):
+def _add_output_argument(parser, default):
     parser.add_argument("--output-dir", type=project_path, default=project_path(default),
                         help="Folder for this command's files, relative to the project root")
 
 
 def build_parser(defaults=None):
+    """Describe commands and flags, using TOML values as overridable defaults."""
     defaults = defaults or {}
     report_defaults = defaults.get("report", {})
     parser = argparse.ArgumentParser(prog="python -m loan_analyst", description=DESCRIPTION,
@@ -129,11 +135,11 @@ def build_parser(defaults=None):
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
     report = commands.add_parser("report", help="Write report.md plus evidence files")
-    _database(report, defaults)
-    _snapshot(report)
-    _scenario(report, defaults)
-    _model(report, defaults)
-    _output(report, report_defaults.get("output_dir", "outputs/framework_report"))
+    _add_database_arguments(report, defaults)
+    _add_snapshot_argument(report)
+    _add_scenario_arguments(report, defaults)
+    _add_model_arguments(report, defaults)
+    _add_output_argument(report, report_defaults.get("output_dir", "outputs/framework_report"))
     report.add_argument("--sections", type=sections, default=report_defaults.get("sections", list(DEFAULT_SECTIONS)),
                         help="Comma-separated report sections in order: " + ",".join(DEFAULT_SECTIONS))
     report.add_argument("--no-ai", action="store_true", help="Explicitly write only the calculated MySQL report")
@@ -144,11 +150,11 @@ def build_parser(defaults=None):
         command = commands.add_parser(name, help=help_text)
         if name == "ask":
             command.add_argument("question", help="Question in plain English, in quotes")
-        _database(command, defaults)
-        _snapshot(command)
-        _scenario(command, defaults)
-        _model(command, defaults)
-        _output(command, folder)
+        _add_database_arguments(command, defaults)
+        _add_snapshot_argument(command)
+        _add_scenario_arguments(command, defaults)
+        _add_model_arguments(command, defaults)
+        _add_output_argument(command, folder)
 
     render = commands.add_parser("render", help="Re-render report.md from a report folder's saved artifacts")
     render.add_argument("directory", type=project_path, help="Report folder, e.g. outputs/framework_report")
@@ -158,45 +164,72 @@ def build_parser(defaults=None):
     call = commands.add_parser("call", help="Run one tool and print JSON facts and results")
     call.add_argument("name", help="Tool name from the `tools` command")
     call.add_argument("arguments", nargs="?", default="{}", help="JSON object, or '-' to read it from stdin")
-    _database(call, defaults)
-    _snapshot(call)
-    _scenario(call, defaults)
+    _add_database_arguments(call, defaults)
+    _add_snapshot_argument(call)
+    _add_scenario_arguments(call, defaults)
 
     sql = commands.add_parser("sql", help="Print the aggregate SQL without connecting")
-    _database(sql, defaults)
+    _add_database_arguments(sql, defaults)
     snapshot = commands.add_parser("snapshot", help="Read MySQL once and save a reusable snapshot")
-    _database(snapshot, defaults)
+    _add_database_arguments(snapshot, defaults)
     return parser
 
 
 def _options(parser, args):
     """Build validated settings; any rule violation is a usage error (exit status 2)."""
     try:
-        database = DatabaseConfig(host=args.host, port=args.port, user=args.user, database=args.database,
-                                  accepted_table=args.accepted_table, rejected_table=args.rejected_table,
-                                  query_timeout=args.query_timeout)
+        database = DatabaseConfig(
+            host=args.host,
+            port=args.port,
+            user=args.user,
+            database=args.database,
+            accepted_table=args.accepted_table,
+            rejected_table=args.rejected_table,
+            query_timeout=args.query_timeout,
+        )
+        # SQL preview and snapshot capture do not run any analysis.
         if not hasattr(args, "cutoffs"):
-            return RunOptions(database, None)
-        scenario = Scenario(cutoffs=args.cutoffs, baseline=args.baseline, start_month=args.start_month,
-                            end_month=args.end_month, max_loss_rate=args.max_loss_rate,
-                            min_outcomes=args.min_outcomes, assume_comparable_scores=args.assume_comparable_scores,
-                            rejected_loss_rate=args.rejected_loss_rate, take_up_rate=args.take_up_rate)
+            return RunOptions(database=database, scenario=None)
+        scenario = Scenario(
+            cutoffs=args.cutoffs,
+            baseline=args.baseline,
+            start_month=args.start_month,
+            end_month=args.end_month,
+            max_loss_rate=args.max_loss_rate,
+            min_outcomes=args.min_outcomes,
+            assume_comparable_scores=args.assume_comparable_scores,
+            rejected_loss_rate=args.rejected_loss_rate,
+            take_up_rate=args.take_up_rate,
+        )
         model = None
         if hasattr(args, "ollama_url") and not getattr(args, "no_ai", False):
-            model = ModelConfig(url=args.ollama_url, model=args.ollama_model, timeout=args.ollama_timeout,
-                                keep_alive=args.ollama_keep_alive, num_ctx=args.num_ctx,
-                                max_tool_rounds=args.max_tool_rounds, max_tool_calls=args.max_tool_calls)
-        extra = {"sections": check_sections(args.sections)} if hasattr(args, "sections") else {}
+            model = ModelConfig(
+                url=args.ollama_url,
+                model=args.ollama_model,
+                timeout=args.ollama_timeout,
+                keep_alive=args.ollama_keep_alive,
+                num_ctx=args.num_ctx,
+                max_tool_rounds=args.max_tool_rounds,
+                max_tool_calls=args.max_tool_calls,
+            )
+
+        # Keep RunOptions defaults for flags that this command does not expose.
+        extra = {}
+        if hasattr(args, "sections"):
+            extra["sections"] = check_sections(args.sections)
         if hasattr(args, "output_dir"):
             extra["output_dir"] = args.output_dir
-        snapshot = args.snapshot if args.snapshot in (None, "latest") else str(project_path(args.snapshot))
-        return RunOptions(database, scenario, model, snapshot=snapshot, **extra)
+        snapshot = args.snapshot
+        if snapshot not in (None, "latest"):
+            snapshot = str(project_path(snapshot))
+        return RunOptions(database=database, scenario=scenario, model=model, snapshot=snapshot, **extra)
     except SettingsError as error:
         parser.error(str(error))
 
 
 def _defaults(argv, services):
     """Load --config, or loan_analyst.toml at the project root when it exists."""
+    # Read only --config first: its contents supply defaults to the full parser.
     early = argparse.ArgumentParser(add_help=False)
     early.add_argument("--config")
     known, _ = early.parse_known_args(argv)
@@ -225,6 +258,7 @@ def _call(options, args, services):
 
 
 def main(argv=None, services=None):
+    """Parse input, dispatch one command, and return its process exit code."""
     services = services or Services()
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -253,7 +287,8 @@ def main(argv=None, services=None):
             return run_chat(options, services)
         if args.command == "render":
             return run_render(args.directory, check_sections(args.sections), services)
-        return _call(options, args, services)
+        if args.command == "call":
+            return _call(options, args, services)
     except KeyboardInterrupt:
         print("Interrupted; no database data was changed", file=sys.stderr)
         return 130

@@ -11,25 +11,46 @@ SCENARIO_KEYS = ("cutoffs", "baseline", "start_month", "end_month", "max_loss_ra
 
 
 def ratio(numerator, denominator):
+    """Return an unavailable rate (None) when there is no denominator."""
     return numerator / denominator if denominator else None
 
 
 def total(rows):
     """Add counts exactly and money with correctly rounded sums. Absent fields (rejected
     performance) are structural zeros, not measured outcomes."""
-    return {field: sum(row.get(field, 0) for row in rows) if field.endswith("rows")
-            else math.fsum(row.get(field, 0) for row in rows) for field in SUM_FIELDS}
+    totals = {}
+    for field in SUM_FIELDS:
+        values = (row.get(field, 0) for row in rows)
+        if field.endswith("rows"):
+            totals[field] = sum(values)
+        else:
+            totals[field] = math.fsum(values)
+    return totals
 
 
 def performance(totals, min_outcomes):
-    """Terminal-outcome rates; unavailable (None) below min_outcomes, never zero."""
+    """Calculate rates using the population appropriate to each measure.
+
+    Terminal loans are Fully Paid or Charged Off. The loss proxy uses only
+    terminal loans with complete financial data; its denominator is principal,
+    not a loan count. Too few outcomes makes a rate unavailable, not zero.
+    """
+    terminal_count = totals["terminal_rows"]
+    complete_count = totals["performance_rows"]
+
+    chargeoff_rate = None
+    if terminal_count >= min_outcomes:
+        chargeoff_rate = ratio(totals["charged_off_rows"], terminal_count)
+
+    loss_rate = None
+    if complete_count >= min_outcomes:
+        loss_rate = ratio(totals["loss_amount"], totals["performance_principal"])
+
     return {
-        "terminal_share": ratio(totals["terminal_rows"], totals["rows"]),
-        "chargeoff_rate": ratio(totals["charged_off_rows"], totals["terminal_rows"])
-            if totals["terminal_rows"] >= min_outcomes else None,
-        "loss_rate": ratio(totals["loss_amount"], totals["performance_principal"])
-            if totals["performance_rows"] >= min_outcomes else None,
-        "loss_data_coverage": ratio(totals["performance_rows"], totals["terminal_rows"]),
+        "terminal_share": ratio(terminal_count, totals["rows"]),
+        "chargeoff_rate": chargeoff_rate,
+        "loss_rate": loss_rate,
+        "loss_data_coverage": ratio(complete_count, terminal_count),
     }
 
 
@@ -50,9 +71,19 @@ def quality(bands):
 
 def select_candidate(scenarios, ceiling):
     """Most retained accepted loans among cutoffs meeting the ceiling with complete data."""
-    eligible = [row for row in scenarios if ceiling is not None and row["loss_rate"] is not None
-                and row["loss_rate"] <= ceiling and row["loss_data_coverage"] == 1]
-    return max(eligible, key=lambda row: (row["accepted"]["rows"], row["cutoff"])) if eligible else None
+    if ceiling is None:
+        return None
+
+    eligible = []
+    for row in scenarios:
+        # performance() already withholds loss rates with too few outcomes.
+        if row["loss_rate"] is None:
+            continue
+        if row["loss_rate"] <= ceiling and row["loss_data_coverage"] == 1:
+            eligible.append(row)
+
+    # When retained counts tie, keep the higher cutoff.
+    return max(eligible, key=lambda row: (row["accepted"]["rows"], row["cutoff"]), default=None)
 
 
 def slug(text):

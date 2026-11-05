@@ -14,37 +14,77 @@ def analyze(snapshot, scenario):
 
 
 def analyze_bands(aggregates, scenario):
-    """Cumulative cutoff scenarios from disjoint bands (see Cube.bands)."""
+    """Combine score bands, compare each cutoff to baseline, then select a candidate.
+
+    A band holds a disjoint score range. A cutoff includes that band and every
+    higher band, so its counts overlap with those of other cutoffs.
+    """
     scored_accepted = sum(row["rows"] for row in aggregates[ACCEPTED]
                           if row["scope"] == "in_scope" and row["bucket"] >= 0)
-    assumed = scenario.assume_comparable_scores
     scenarios = []
     for cutoff in scenario.cutoffs:
-        selected = {kind: total([row for row in rows if row["scope"] == "in_scope" and row["bucket"] >= cutoff])
-                    for kind, rows in aggregates.items()}
-        accepted, rejected = selected[ACCEPTED], selected[REJECTED]
+        selected = _totals_at_cutoff(aggregates, cutoff)
+        accepted = selected[ACCEPTED]
+        rejected = selected[REJECTED]
         scenarios.append({
             "cutoff": cutoff, "accepted": accepted, "rejected": rejected,
             "accepted_retention_rate": ratio(accepted["rows"], scored_accepted),
             **performance(accepted, scenario.min_outcomes),
-            "assumed_new_loans": rejected["amount_rows"] * scenario.take_up_rate if assumed else None,
-            "assumed_new_principal": rejected["amount_sum"] * scenario.take_up_rate if assumed else None,
-            "assumed_new_loss": rejected["amount_sum"] * scenario.take_up_rate * scenario.rejected_loss_rate
-                if assumed else None,
+            **_expansion_assumptions(rejected, scenario),
         })
+
+    # Settings always include the baseline among the tested cutoffs.
     baseline = next(row for row in scenarios if row["cutoff"] == scenario.baseline)
     for row in scenarios:
-        row["accepted_count_change"] = row["accepted"]["rows"] - baseline["accepted"]["rows"]
-        row["accepted_volume_change"] = row["accepted"]["amount_sum"] - baseline["accepted"]["amount_sum"]
-        row["accepted_growth_rate"] = ratio(row["accepted_count_change"], baseline["accepted"]["rows"])
-        row["loss_rate_change_pp"] = (100 * (row["loss_rate"] - baseline["loss_rate"])
-                                      if row["loss_rate"] is not None and baseline["loss_rate"] is not None else None)
-        if assumed:
-            row["hypothetical_total_loans"] = row["accepted"]["rows"] + row["assumed_new_loans"]
-            row["hypothetical_count_change"] = row["hypothetical_total_loans"] - baseline["accepted"]["rows"]
+        _add_baseline_comparison(row, baseline, scenario.assume_comparable_scores)
+
     candidate = select_candidate(scenarios, scenario.max_loss_rate)
     return {"quality": {kind: quality(rows) for kind, rows in aggregates.items()}, "scenarios": scenarios,
             "baseline": scenario.baseline, "candidate_cutoff": candidate["cutoff"] if candidate else None}
+
+
+def _totals_at_cutoff(aggregates, cutoff):
+    """Count only in-cohort bands that meet the cutoff; invalid scores are excluded."""
+    selected = {}
+    for kind, bands in aggregates.items():
+        retained_bands = [
+            band for band in bands
+            if band["scope"] == "in_scope" and band["bucket"] >= cutoff
+        ]
+        selected[kind] = total(retained_bands)
+    return selected
+
+
+def _expansion_assumptions(rejected, scenario):
+    """Optional user assumptions; rejected applications have no observed repayments."""
+    if not scenario.assume_comparable_scores:
+        return {"assumed_new_loans": None, "assumed_new_principal": None, "assumed_new_loss": None}
+
+    # Only applications with valid requested amounts enter this hypothetical lending.
+    principal = rejected["amount_sum"] * scenario.take_up_rate
+    return {
+        "assumed_new_loans": rejected["amount_rows"] * scenario.take_up_rate,
+        "assumed_new_principal": principal,
+        "assumed_new_loss": principal * scenario.rejected_loss_rate,
+    }
+
+
+def _add_baseline_comparison(row, baseline, include_expansion):
+    """Add differences to one cutoff row, using the accepted-only baseline."""
+    accepted = row["accepted"]
+    baseline_accepted = baseline["accepted"]
+    row["accepted_count_change"] = accepted["rows"] - baseline_accepted["rows"]
+    row["accepted_volume_change"] = accepted["amount_sum"] - baseline_accepted["amount_sum"]
+    row["accepted_growth_rate"] = ratio(row["accepted_count_change"], baseline_accepted["rows"])
+
+    row["loss_rate_change_pp"] = None
+    if row["loss_rate"] is not None and baseline["loss_rate"] is not None:
+        # Rates are fractions; multiplying their difference by 100 gives percentage points.
+        row["loss_rate_change_pp"] = 100 * (row["loss_rate"] - baseline["loss_rate"])
+
+    if include_expansion:
+        row["hypothetical_total_loans"] = accepted["rows"] + row["assumed_new_loans"]
+        row["hypothetical_count_change"] = row["hypothetical_total_loans"] - baseline_accepted["rows"]
 
 
 def _baseline(result):

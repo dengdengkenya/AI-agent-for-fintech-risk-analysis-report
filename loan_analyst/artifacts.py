@@ -1,11 +1,15 @@
-"""Atomic file writes: complete artifacts replace old ones together, or not at all."""
+"""Stage complete artifacts, then replace each destination file."""
 
 from pathlib import Path
 import tempfile
 
 
 def write_files(directory, files):
-    """Stage every file before replacing any; a failure leaves earlier outputs untouched."""
+    """Leave existing files alone if staging fails; replace files only after staging.
+
+    Each replacement is atomic, but the group is not a filesystem transaction:
+    a failure during replacement can leave a mix of old and new files.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     staged = []

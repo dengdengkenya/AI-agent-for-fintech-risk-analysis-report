@@ -14,7 +14,12 @@ GROUPINGS = {"score_era": "score era", "application_year": "application year"}
 
 
 def era(period):
-    return "fico" if period < SCORE_SYSTEM_CHANGE else "transition" if period == SCORE_SYSTEM_CHANGE else "vantage"
+    """Keep the changeover month separate because a monthly aggregate mixes systems."""
+    if period < SCORE_SYSTEM_CHANGE:
+        return "fico"
+    if period == SCORE_SYSTEM_CHANGE:
+        return "transition"
+    return "vantage"
 
 
 def _screen(rows):
@@ -23,21 +28,32 @@ def _screen(rows):
 
 
 def analyze(snapshot, scenario, by="score_era"):
+    """Count numeric screens within each era or year, without inferring loan outcomes."""
     rows = snapshot.cubes[REJECTED].select(scenario.start_month, scenario.end_month)
-    key = (lambda row: era(row["period"])) if by == "score_era" else (lambda row: row["period"][:4])
     groups = {}
     for row in rows:
-        groups.setdefault(key(row), []).append(row)
+        if by == "score_era":
+            key = era(row["period"])
+        else:
+            key = row["period"][:4]
+        groups.setdefault(key, []).append(row)
+
     order = list(ERAS) if by == "score_era" else sorted(groups)
     result = []
-    for group in (group for group in order if group in groups):
+    for group in order:
+        if group not in groups:
+            continue
         members = groups[group]
         usable = [row for row in members if row["score"] is not None]
+        screens = []
+        for cutoff in scenario.cutoffs:
+            screened = [row for row in usable if row["score"] >= cutoff]
+            screens.append({"cutoff": cutoff, **_screen(screened)})
+
         result.append({
             "group": ERAS[group] if by == "score_era" else group, **_screen(members),
             "usable_score_rows": sum(row["rows"] for row in usable),
-            "screens": [{"cutoff": cutoff, **_screen([row for row in usable if row["score"] >= cutoff])}
-                        for cutoff in scenario.cutoffs],
+            "screens": screens,
         })
     return {"by": by, "cohort": scenario.cohort, "baseline": scenario.baseline,
             "cutoffs": list(scenario.cutoffs), "groups": result}

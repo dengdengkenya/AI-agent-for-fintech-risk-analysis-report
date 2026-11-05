@@ -1,5 +1,9 @@
 # MySQL loan reports with a local tool-calling analyst
 
+**New to the code?** Start with the [developer guide](docs/DEVELOPER_GUIDE.md).
+It walks through one report, explains the main data structures, and shows where
+to make common changes without needing a running database or model.
+
 Generate reports from the existing MySQL tables `demo.accepted` and
 `demo.rejected`, and ask questions about them in plain English. The schema is
 named `demo`, but these are the real imported loan tables. Reporting has no

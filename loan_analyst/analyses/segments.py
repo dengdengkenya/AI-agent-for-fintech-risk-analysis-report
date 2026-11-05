@@ -19,36 +19,55 @@ def band_label(band, cutoffs):
     return f"{band}+" if index == len(cutoffs) - 1 else f"{band}-{cutoffs[index + 1] - 1}"
 
 
-def _grouping(dimension, cutoffs):
-    """(key, label, sort key) functions for one dimension; invalid values sort last."""
+def _segment_key(row, dimension, cutoffs):
+    """Choose the group that receives this aggregate row."""
     if dimension == "score_band":
-        return (lambda row: bucket(row["score"], cutoffs), lambda key: band_label(key, cutoffs),
-                lambda key: (key == -1, key))
+        return bucket(row["score"], cutoffs)
     if dimension == "issue_year":
-        return lambda row: row["period"][:4], str, str
-    if dimension == "term":
-        return (lambda row: row["term"] or MISSING, lambda key: key if key == MISSING else f"{key} months",
-                lambda key: (key == MISSING, key))
-    return lambda row: row[dimension] or MISSING, str, lambda key: (key == MISSING, key)
+        return row["period"][:4]
+    return row[dimension] or MISSING
+
+
+def _segment_label(key, dimension, cutoffs):
+    if dimension == "score_band":
+        return band_label(key, cutoffs)
+    if dimension == "term" and key != MISSING:
+        return f"{key} months"
+    return str(key)
+
+
+def _segment_order(key, dimension):
+    """Sort ordinary values first and invalid/missing values last."""
+    if dimension == "score_band":
+        return (key == -1, key)
+    if dimension == "issue_year":
+        return str(key)
+    return (key == MISSING, key)
 
 
 def analyze(snapshot, scenario, dimension, min_score=None):
+    """Filter the cohort, group its rows, then calculate each group's share and rates."""
     cube = snapshot.cubes[ACCEPTED]
     if dimension not in TITLES:
         raise ValueError(f"Unknown dimension: {dimension}")
     if dimension in ("grade", "term") and dimension not in cube.dimensions:
         raise ToolUnavailable(f"{dimension} is unavailable: the accepted table has no {dimension} column")
     rows = cube.select(scenario.start_month, scenario.end_month, min_score=min_score)
-    key, label, order = _grouping(dimension, scenario.cutoffs)
     groups = {}
     for row in rows:
-        groups.setdefault(key(row), []).append(row)
+        key = _segment_key(row, dimension, scenario.cutoffs)
+        groups.setdefault(key, []).append(row)
+
     loans = sum(row["rows"] for row in rows)
     segments = []
-    for group in sorted(groups, key=order):
+    for group in sorted(groups, key=lambda key: _segment_order(key, dimension)):
         totals = total(groups[group])
-        segments.append({"segment": label(group), "accepted": totals, "loan_share": ratio(totals["rows"], loans),
-                         **performance(totals, scenario.min_outcomes)})
+        segments.append({
+            "segment": _segment_label(group, dimension, scenario.cutoffs),
+            "accepted": totals,
+            "loan_share": ratio(totals["rows"], loans),
+            **performance(totals, scenario.min_outcomes),
+        })
     return {"dimension": dimension, "min_score": min_score, "cohort": scenario.cohort,
             "min_outcomes": scenario.min_outcomes, "loans": loans, "segments": segments}
 

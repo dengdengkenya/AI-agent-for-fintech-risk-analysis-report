@@ -87,6 +87,8 @@ def build_query(kind, config, dimensions=None):
         score_sql = ("CASE WHEN score_low BETWEEN 300 AND 850 AND score_high BETWEEN 300 AND 850 "
                      "AND score_low <= score_high AND MOD(score_low,1)=0 AND MOD(score_high,1)=0 "
                      "THEN (score_low+score_high)/2 END")
+        # Open loans do not have terminal outcomes. Missing financial values must
+        # not become zero losses, so performance requires every financial field.
         terminal = "status IN ('Fully Paid','Charged Off')"
         valid = f"({terminal}) AND amount > 0 AND principal_received BETWEEN 0 AND amount AND recovered >= 0"
         metrics = f""",
@@ -121,10 +123,17 @@ FROM scored GROUP BY {keys} ORDER BY {keys}"""
 
 def bucket(score, cutoffs):
     """Highest cutoff met; 0 for a valid score below every cutoff; -1 for an invalid score."""
-    return -1 if score is None else next((cutoff for cutoff in reversed(cutoffs) if score >= cutoff), 0)
+    if score is None:
+        return -1
+    # Scenario validates and sorts cutoffs before any analysis runs.
+    for cutoff in reversed(cutoffs):
+        if score >= cutoff:
+            return cutoff
+    return 0
 
 
 def classify(period, start_month=None, end_month=None):
+    """Classify a parsed YYYY-MM month using inclusive cohort bounds."""
     if period is None:
         return "invalid_date"
     if (start_month and period < start_month) or (end_month and period > end_month):
@@ -134,15 +143,23 @@ def classify(period, start_month=None, end_month=None):
 
 def sums(rows, metrics):
     """Exact counts and correctly rounded money sums (math.fsum)."""
-    return {metric: sum(row[metric] for row in rows) if metric.endswith("rows")
-            else math.fsum(row[metric] for row in rows) for metric in metrics}
+    totals = {}
+    for metric in metrics:
+        values = (row[metric] for row in rows)
+        if metric.endswith("rows"):
+            totals[metric] = sum(values)
+        else:
+            totals[metric] = math.fsum(values)
+    return totals
 
 
 class Cube:
     """Grouped rows for one source: group keys plus additive count and sum metrics."""
 
     def __init__(self, kind, dimensions, rows):
-        self.kind, self.dimensions, self.metrics = kind, tuple(dimensions), METRICS[kind]
+        self.kind = kind
+        self.dimensions = tuple(dimensions)
+        self.metrics = METRICS[kind]
         self.keys = ("period", "score", *self.dimensions)
         self.rows = list(rows)
         expected = set(self.keys) | set(self.metrics)
@@ -158,15 +175,28 @@ class Cube:
 
     def select(self, start_month=None, end_month=None, min_score=None):
         """In-cohort rows, optionally only those with a valid score at or above min_score."""
-        return [row for row in self.rows if classify(row["period"], start_month, end_month) == "in_scope"
-                and (min_score is None or (row["score"] is not None and row["score"] >= min_score))]
+        selected = []
+        for row in self.rows:
+            if classify(row["period"], start_month, end_month) != "in_scope":
+                continue
+            if min_score is not None:
+                meets_cutoff = row["score"] is not None and row["score"] >= min_score
+                if not meets_cutoff:
+                    continue
+            selected.append(row)
+        return selected
 
     def bands(self, cutoffs, start_month=None, end_month=None):
-        """Disjoint (scope, bucket) bands, exactly as a parameterized SQL GROUP BY would return."""
+        """Group by cohort membership and score band, keeping exclusions visible.
+
+        Unlike select(), this includes out-of-cohort rows and invalid scores so
+        quality reports can explain how many source loans were excluded.
+        """
         groups = {}
         for row in self.rows:
-            key = (classify(row["period"], start_month, end_month), bucket(row["score"], cutoffs))
-            groups.setdefault(key, []).append(row)
+            scope = classify(row["period"], start_month, end_month)
+            band = bucket(row["score"], cutoffs)
+            groups.setdefault((scope, band), []).append(row)
         bands = []
         for (scope, band), rows in sorted(groups.items()):
             periods = [row["period"] for row in rows if row["period"]]
@@ -192,7 +222,11 @@ def _plain(key, value):
 
 @dataclass(frozen=True)
 class Snapshot:
-    """A consistent read of both sources: cubes, provenance and a content hash."""
+    """A consistent read of both sources: cubes, provenance and a content hash.
+
+    A cube is one table's grouped rows. A snapshot pairs both cubes with the
+    source names, queries and read times needed to reproduce the report.
+    """
 
     database: str
     sources: dict
@@ -242,8 +276,10 @@ class Snapshot:
         try:
             if payload.get("format") != SNAPSHOT_FORMAT:
                 raise ValueError
-            cubes = {kind: Cube.from_payload(kind, payload["sources"][kind]["dimensions"], payload["cubes"][kind])
-                     for kind in SOURCES}
+            cubes = {}
+            for kind in SOURCES:
+                dimensions = payload["sources"][kind]["dimensions"]
+                cubes[kind] = Cube.from_payload(kind, dimensions, payload["cubes"][kind])
             snapshot = cls.create(payload["database"], payload["sources"], payload["queries"], cubes,
                                   payload["read_started_at_utc"], payload["read_completed_at_utc"], origin)
         except (AttributeError, KeyError, TypeError, ValueError):
@@ -253,21 +289,33 @@ class Snapshot:
         return snapshot
 
 
+def _source_metadata(cursor, config, kind):
+    """Validate one table and record which optional grouping columns it provides."""
+    table = getattr(config, f"{kind}_table")
+    engine, columns = table_metadata(cursor, config.database, table)
+    if engine != "InnoDB":
+        raise SchemaError(f"{kind}: expected an existing InnoDB table")
+    missing = sorted(REQUIRED[kind] - columns)
+    if missing:
+        raise SchemaError(f"{kind}: missing required columns: " + ", ".join(missing))
+    return {
+        "table": table,
+        "engine": engine,
+        "dimensions": [item.name for item in DIMENSIONS[kind] if item.column in columns],
+    }
+
+
 def read_snapshot(connection, config, clock=utc_now):
     """Check both schemas, then scan each source once inside one read-only snapshot."""
     started = clock()
-    sources, queries, cubes = {}, {}, {}
+    sources = {}
+    queries = {}
+    cubes = {}
     with read_only_snapshot(connection) as cursor:
+        # Finish both cheap metadata checks before starting either expensive scan.
         for kind in SOURCES:
-            table = getattr(config, f"{kind}_table")
-            engine, columns = table_metadata(cursor, config.database, table)
-            if engine != "InnoDB":
-                raise SchemaError(f"{kind}: expected an existing InnoDB table")
-            missing = sorted(REQUIRED[kind] - columns)
-            if missing:
-                raise SchemaError(f"{kind}: missing required columns: " + ", ".join(missing))
-            sources[kind] = {"table": table, "engine": engine,
-                             "dimensions": [item.name for item in DIMENSIONS[kind] if item.column in columns]}
+            sources[kind] = _source_metadata(cursor, config, kind)
+
         for kind in SOURCES:
             dimensions = [item for item in DIMENSIONS[kind] if item.name in sources[kind]["dimensions"]]
             queries[kind] = build_query(kind, config, dimensions)

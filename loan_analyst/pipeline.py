@@ -26,7 +26,7 @@ from .evidence import AnalysisError, Ledger, validate_answer
 from .jsonutil import read_json, sha256_json
 from .llm import ModelError, OllamaClient
 from .report import DEFAULT_SECTIONS, answer_markdown, answer_text, render_report
-from .settings import SettingsError
+from .settings import DatabaseConfig, ModelConfig, Scenario, SettingsError
 from .tools import ToolContext
 
 REPORT_FORMAT = "loan-analyst-report/1"
@@ -52,7 +52,11 @@ def status(message):
 
 @dataclass
 class Services:
-    """Replaceable collaborators; tests and other hosts inject their own."""
+    """Things a workflow uses outside Python's calculations.
+
+    Production uses the defaults. Tests supply fake connections, a scripted model,
+    a fixed clock and captured terminal I/O, so they need no running services.
+    """
 
     connection_factory: Callable = password_connection_factory
     model_factory: Callable = OllamaClient
@@ -66,9 +70,11 @@ class Services:
 
 @dataclass(frozen=True)
 class RunOptions:
-    database: object
-    scenario: object
-    model: object = None  # None disables the model (report --no-ai)
+    """Validated inputs for one command, separate from its external services."""
+
+    database: DatabaseConfig
+    scenario: Scenario | None  # SQL preview and snapshot-only commands need no scenario.
+    model: ModelConfig | None = None  # None disables the model (report --no-ai).
     output_dir: Path = PROJECT_ROOT / "outputs" / "framework_report"
     snapshot: str | None = None  # a saved snapshot path, or "latest"
     sections: tuple = DEFAULT_SECTIONS
@@ -104,6 +110,7 @@ def obtain_snapshot(database, reference, services):
 
 
 def toolbox(snapshot, scenario, modules=MODULES):
+    """Create the allowed tools, their shared inputs, and a place to record facts."""
     return build_registry(modules), ToolContext(snapshot, scenario), Ledger(DEFINITIONS)
 
 
@@ -127,6 +134,7 @@ def progress(log):
         if event == "investigating":
             log(f"  Round {details['round']}: the analyst is choosing tools...")
         elif event == "tool":
+            # Repeats reuse the ledger record and fact IDs; the handler still runs.
             repeat = " (repeat, cached)" if details["repeated"] else ""
             log(f"    {details['call_id']} {details['name']}({_short(details['arguments'])}){repeat}")
         elif event == "tool_error":
@@ -138,14 +146,15 @@ def progress(log):
     return on_event
 
 
-def _client(options, services):
+def _prepare_model(options, services):
+    """Fail early if the local model is unusable, before an expensive MySQL scan."""
     services.log(f"Checking local Ollama model {options.model.model}...")
     client = services.model_factory(options.model)
     client.preflight()
     return client
 
 
-def _analyst(client, registry, context, ledger, options, services):
+def _create_analyst(client, registry, context, ledger, options, services):
     return Analyst(client, registry, context, ledger, max_rounds=options.model.max_tool_rounds,
                    max_calls=options.model.max_tool_calls, on_event=progress(services.log))
 
@@ -154,51 +163,102 @@ def _model_calls(ledger):
     return [call for call in ledger.calls if call["origin"] == "model"]
 
 
-def _stamp(services):
+def _timestamp(services):
     return datetime.fromisoformat(services.clock()).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def report_data(evidence, analysis):
     """Everything report sections read; rebuildable from the saved artifacts."""
-    return {key: evidence[key] for key in ("run_id", "generated_at_utc", "source_evidence_sha256", "settings",
-                                           "snapshot", "facts")} | {
-        "calls": [*evidence["calls"], *analysis.get("tool_results", [])], "analysis": analysis}
-
-
-def run_report(options, services):
-    started = perf_counter()
-    client = _client(options, services) if options.model is not None else None
-    snapshot = obtain_snapshot(options.database, options.snapshot, services)
-    registry, context, ledger = toolbox(snapshot, options.scenario, options.modules)
-    run_calls(registry, context, ledger, REPORT_CALLS)
-    services.log(f"Computed {len(ledger.calls)} analyses from the snapshot.")
-    report_calls = [{key: call[key] for key in ("id", "tool", "arguments", "origin", "title", "fact_ids", "result")}
-                    for call in ledger.calls]
-    settings = {"database": options.database.sources(), "scenario": options.scenario.to_dict()}
-    source = {"mode": "historical_mysql", "settings": settings, "snapshot_sha256": snapshot.content_sha256,
-              "queries": snapshot.queries, "results": report_calls}
-    evidence = {
-        "format": REPORT_FORMAT, "mode": "historical_mysql", "run_id": str(uuid4()),
-        "source_evidence_sha256": sha256_json(source), "generated_at_utc": services.clock(),
-        "settings": settings, "snapshot": snapshot.provenance(), "queries": snapshot.queries,
-        "calls": report_calls, "facts": dict(ledger.facts),
+    return {
+        "run_id": evidence["run_id"],
+        "generated_at_utc": evidence["generated_at_utc"],
+        "source_evidence_sha256": evidence["source_evidence_sha256"],
+        "settings": evidence["settings"],
+        "snapshot": evidence["snapshot"],
+        "facts": evidence["facts"],
+        "calls": [*evidence["calls"], *analysis.get("tool_results", [])],
+        "analysis": analysis,
     }
-    if client is None:
-        analysis = {"status": "disabled", "reason": "Explicit --no-ai option"}
-    else:
-        services.log("Analyst reviewing the results; it may run further tools over the snapshot...")
-        analysis = _analyst(client, registry, context, ledger, options, services).run(
-            prompts.REPORT_GOAL, sections=REPORT_SECTIONS, preload=ledger.highlights("report"))
-        analysis["tool_results"] = _model_calls(ledger)
-    analysis.update(run_id=evidence["run_id"], source_evidence_sha256=evidence["source_evidence_sha256"])
-    evidence["ai_analysis"] = {key: analysis[key] for key in ("status", "run_id", "source_evidence_sha256")}
-    evidence["elapsed_seconds"] = perf_counter() - started
+
+
+def _build_report_evidence(options, snapshot, ledger, services):
+    """Freeze the calculated results before the model adds its own tool calls.
+
+    The source hash links the report and model answer to these exact inputs.
+    DatabaseConfig.sources() deliberately excludes the host, user and credentials.
+    """
+    report_calls = []
+    for call in ledger.calls:
+        report_calls.append({
+            "id": call["id"],
+            "tool": call["tool"],
+            "arguments": call["arguments"],
+            "origin": call["origin"],
+            "title": call["title"],
+            "fact_ids": call["fact_ids"],
+            "result": call["result"],
+        })
+    settings = {"database": options.database.sources(), "scenario": options.scenario.to_dict()}
+    source = {
+        "mode": "historical_mysql",
+        "settings": settings,
+        "snapshot_sha256": snapshot.content_sha256,
+        "queries": snapshot.queries,
+        "results": report_calls,
+    }
+    return {
+        "format": REPORT_FORMAT,
+        "mode": "historical_mysql",
+        "run_id": str(uuid4()),
+        "source_evidence_sha256": sha256_json(source),
+        "generated_at_utc": services.clock(),
+        "settings": settings,
+        "snapshot": snapshot.provenance(),
+        "queries": snapshot.queries,
+        "calls": report_calls,
+        "facts": dict(ledger.facts),
+    }
+
+
+def _write_report(options, snapshot, evidence, analysis):
+    """Render and serialize everything before staging any replacement files."""
     write_files(options.output_dir, {
         "report.md": render_report(report_data(evidence, analysis), options.sections),
         "aggregates.json": json.dumps(evidence, indent=2, allow_nan=False),
         "snapshot.json": json.dumps(snapshot.to_payload(), separators=(",", ":"), allow_nan=False),
         "ollama_analysis.json": json.dumps(analysis, indent=2, ensure_ascii=False, allow_nan=False),
     })
+
+
+def run_report(options: RunOptions, services: Services):
+    """Read data, calculate facts, validate model commentary, then write the report."""
+    started = perf_counter()
+
+    # Preflight runs first; a model failure should not trigger a long database read.
+    client = _prepare_model(options, services) if options.model is not None else None
+    snapshot = obtain_snapshot(options.database, options.snapshot, services)
+
+    registry, context, ledger = toolbox(snapshot, options.scenario, options.modules)
+    run_calls(registry, context, ledger, REPORT_CALLS)
+    services.log(f"Computed {len(ledger.calls)} analyses from the snapshot.")
+    evidence = _build_report_evidence(options, snapshot, ledger, services)
+
+    if client is None:
+        analysis = {"status": "disabled", "reason": "Explicit --no-ai option"}
+    else:
+        services.log("Analyst reviewing the results; it may run further tools over the snapshot...")
+        analyst = _create_analyst(client, registry, context, ledger, options, services)
+        analysis = analyst.run(
+            prompts.REPORT_GOAL, sections=REPORT_SECTIONS, preload=ledger.highlights("report"))
+        analysis["tool_results"] = _model_calls(ledger)
+
+    analysis.update(run_id=evidence["run_id"], source_evidence_sha256=evidence["source_evidence_sha256"])
+    evidence["ai_analysis"] = {key: analysis[key] for key in ("status", "run_id", "source_evidence_sha256")}
+    evidence["elapsed_seconds"] = perf_counter() - started
+
+    # Reaching this point means the model answer passed validation (or AI is disabled).
+    # Earlier failures leave existing report files alone; the saved snapshot survives.
+    _write_report(options, snapshot, evidence, analysis)
     folder = display_path(options.output_dir)
     services.out(f"Report: {folder}/report.md")
     services.out(f"Evidence: {folder}/aggregates.json, {folder}/snapshot.json, {folder}/ollama_analysis.json")
@@ -206,12 +266,13 @@ def run_report(options, services):
     return 0
 
 
-def _session(options, services):
-    client = _client(options, services)
+def _start_session(options, services):
+    """Prepare one snapshot and analyst shared by all questions in this session."""
+    client = _prepare_model(options, services)
     snapshot = obtain_snapshot(options.database, options.snapshot, services)
     registry, context, ledger = toolbox(snapshot, options.scenario, options.modules)
     run_calls(registry, context, ledger, [("describe_data", {})])
-    return snapshot, ledger, _analyst(client, registry, context, ledger, options, services)
+    return snapshot, ledger, _create_analyst(client, registry, context, ledger, options, services)
 
 
 def _transcript(snapshot, options, turns, ledger):
@@ -221,11 +282,11 @@ def _transcript(snapshot, options, turns, ledger):
 
 
 def run_ask(options, question, services):
-    snapshot, ledger, analyst = _session(options, services)
+    snapshot, ledger, analyst = _start_session(options, services)
     result = analyst.run(question, sections=ASK_SECTIONS, preload=ledger.highlights("report"))
     services.out("")
     services.out(answer_text(result))
-    stamp = _stamp(services)
+    stamp = _timestamp(services)
     write_files(options.output_dir, {
         f"ask-{stamp}.md": answer_markdown(question, result),
         f"ask-{stamp}.json": json.dumps(_transcript(snapshot, options, [{"question": question, "analysis": result}],
@@ -240,7 +301,7 @@ CHAT_HELP = ("Ask a question in plain English. Commands: /tools lists the analys
 
 
 def run_chat(options, services):
-    snapshot, ledger, analyst = _session(options, services)
+    snapshot, ledger, analyst = _start_session(options, services)
     session = ChatSession(analyst, preload=ledger.highlights("report"))
     accepted, rejected = (snapshot.provenance()["sources"][kind]["total_rows"] for kind in SOURCES)
     services.out(f"Loan analyst ready: snapshot {snapshot.snapshot_id}, {accepted:,} accepted and {rejected:,} "
@@ -269,7 +330,7 @@ def run_chat(options, services):
             continue
         services.out("\n" + answer_text(result))
     if session.turns:
-        stamp = _stamp(services)
+        stamp = _timestamp(services)
         turns = [{"question": turn["question"], "analysis": turn["result"]} for turn in session.turns]
         write_files(options.output_dir, {
             f"chat-{stamp}.md": "\n".join(answer_markdown(turn["question"], turn["result"]) for turn in session.turns),
@@ -297,9 +358,13 @@ def run_render(directory, sections, services):
         analysis = read_json((directory / "ollama_analysis.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raise SettingsError(f"{display_path(directory)} does not contain readable report artifacts") from None
-    if evidence.get("format") != REPORT_FORMAT or (analysis.get("run_id"), analysis.get("source_evidence_sha256")) \
-            != (evidence.get("run_id"), evidence.get("source_evidence_sha256")):
-        raise SettingsError("aggregates.json and ollama_analysis.json are not from the same report run")
+    mismatch_message = "aggregates.json and ollama_analysis.json are not from the same report run"
+    if evidence.get("format") != REPORT_FORMAT:
+        raise SettingsError(mismatch_message)
+    expected_identity = (evidence.get("run_id"), evidence.get("source_evidence_sha256"))
+    analysis_identity = (analysis.get("run_id"), analysis.get("source_evidence_sha256"))
+    if analysis_identity != expected_identity:
+        raise SettingsError(mismatch_message)
     if analysis.get("status") == "complete":
         check_review(analysis)
     write_files(directory, {"report.md": render_report(report_data(evidence, analysis), sections)})

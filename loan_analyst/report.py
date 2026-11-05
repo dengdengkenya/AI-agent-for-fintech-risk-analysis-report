@@ -13,9 +13,11 @@ class ReportView:
     """Lookups over run data plus the citation numbering shared by all sections."""
 
     def __init__(self, data):
-        self.data, self.calls, self.analysis = data, data["calls"], data["analysis"]
+        self.data = data
+        self.calls = data["calls"]
+        self.analysis = data["analysis"]
         self.scenario = Scenario(**data["settings"]["scenario"])
-        self.citations = _Numbers()
+        self.citations = _CitationNumbers()
         self.cite = self.citations.markdown
 
     def result(self, tool, **arguments):
@@ -253,21 +255,32 @@ def check_sections(sections):
 
 
 def render_report(data, sections=DEFAULT_SECTIONS):
+    """Render selected sections, assigning evidence numbers as citations appear."""
     view = ReportView(data)
     sections = check_sections(sections)
     # The evidence list numbers citations made by other sections, so it renders last.
-    rendered = {name: SECTIONS[name](view) for name in sections if name != "evidence"}
+    rendered = {}
+    for name in sections:
+        if name != "evidence":
+            render_section = SECTIONS[name]
+            rendered[name] = render_section(view)
     if "evidence" in sections:
         rendered["evidence"] = _evidence(view)
-    return "\n\n".join([_title(view), *(rendered[name] for name in sections if rendered[name])]) + "\n"
+
+    # Display order still follows the user's selection, even for the evidence list.
+    parts = [_title(view)]
+    for name in sections:
+        if rendered[name]:
+            parts.append(rendered[name])
+    return "\n\n".join(parts) + "\n"
 
 
 ANSWER_HEADINGS = (("findings", "What the results show"), ("caveats", "Caveats"),
                    ("next_steps", "Next analytical steps"))
 
 
-class _Numbers(dict):
-    """Citation numbers in order of first use."""
+class _CitationNumbers(dict):
+    """Map each fact ID to its citation number, assigned in order of first use."""
 
     def markdown(self, ids):
         return " ".join(f"[\\[{n}\\]](#evidence-{n})" for n in map(self.number, ids))
@@ -276,12 +289,14 @@ class _Numbers(dict):
         return "".join(f"[{n}]" for n in map(self.number, ids))
 
     def number(self, ref):
-        return self.setdefault(ref, len(self) + 1)
+        if ref not in self:
+            self[ref] = len(self) + 1
+        return self[ref]
 
 
 def answer_markdown(question, analysis):
     """A standalone Markdown answer for `ask` and `chat` transcripts."""
-    numbers = _Numbers()
+    numbers = _CitationNumbers()
     cite = numbers.markdown
     answer = analysis["answer"]
     lines = [f"## {plain(question)}", ""]
@@ -299,7 +314,7 @@ def answer_markdown(question, analysis):
 
 def answer_text(analysis, width=100):
     """Readable terminal rendering with numbered evidence."""
-    numbers = _Numbers()
+    numbers = _CitationNumbers()
     cite = numbers.text
     answer = analysis["answer"]
     lines = [wrap(f"{item['text']} {cite(item['evidence_ids'])}", width=width) for item in answer["answer"]]

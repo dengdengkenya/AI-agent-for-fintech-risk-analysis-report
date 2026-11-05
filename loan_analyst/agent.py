@@ -27,10 +27,18 @@ def _quiet(event, **details):
 
 
 def cited_ids(answer):
-    return list(dict.fromkeys(ref for items in answer.values() for item in items for ref in item["evidence_ids"]))
+    """Return unique evidence IDs in the order they first appear in the answer."""
+    references = []
+    for statements in answer.values():
+        for statement in statements:
+            for fact_id in statement["evidence_ids"]:
+                if fact_id not in references:
+                    references.append(fact_id)
+    return references
 
 
 def _bounded(arguments):
+    """Keep invalid tool arguments short and JSON-safe in the saved transcript."""
     try:
         return json.dumps(arguments, ensure_ascii=False, allow_nan=False)[:500]
     except (TypeError, ValueError):
@@ -41,40 +49,87 @@ class Analyst:
     """Runs one goal through bounded tool rounds and a validated, structured answer."""
 
     def __init__(self, client, registry, context, ledger, *, max_rounds=4, max_calls=8, on_event=_quiet):
-        self.client, self.registry, self.context, self.ledger = client, registry, context, ledger
-        self.max_rounds, self.max_calls, self.on_event = max_rounds, max_calls, on_event
+        self.client = client
+        self.registry = registry
+        self.context = context
+        self.ledger = ledger
+        self.max_rounds = max_rounds
+        self.max_calls = max_calls
+        self.on_event = on_event
 
     def run(self, goal, *, sections=ASK_SECTIONS, preload=(), history=()):
         """Investigate, compose and validate; returns a JSON-safe analysis artifact."""
         started = perf_counter()
+        # The ledger can contain more facts than this model has seen. Only visible
+        # facts may be cited, including definitions and explicitly preloaded facts.
         self._visible = list(dict.fromkeys([*self.ledger.definition_ids, *preload]))
         tools = self.registry.definitions()
-        exchanges, calls = [], []
-        messages = [{"role": "system", "content": prompts.SYSTEM}, *history,
-                    {"role": "user", "content": prompts.investigate(goal, self.ledger.select(self._visible))}]
+        exchanges = []
+        calls = []
+
+        self._investigate(goal, history, tools, exchanges, calls)
+        answer, withheld, attempts, facts = self._compose(goal, sections, exchanges, history)
+        statement_count = sum(len(statements) for statements in answer.values())
+        self.on_event("answered", statements=statement_count, withheld=len(withheld))
+
+        usage = {}
+        for key in USAGE_KEYS:
+            usage[key] = sum(exchange["usage"].get(key) or 0 for exchange in exchanges)
+
+        return {
+            "status": "complete",
+            **(self.client.metadata or {}),
+            "prompt_version": prompts.VERSION,
+            "goal": goal,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "elapsed_seconds": perf_counter() - started,
+            "attempts": len(attempts),
+            "validation_problems": attempts,
+            "tool_definitions": tools,
+            "tool_definitions_sha256": sha256_json(tools),
+            "exchanges": exchanges,
+            "tool_calls": calls,
+            "facts": facts,
+            "model_draft": answer,
+            "answer": deepcopy(answer),
+            "withheld": withheld,
+            "validation": VALIDATION_NOTE,
+            "usage": usage,
+        }
+
+    def _investigate(self, goal, history, tools, exchanges, calls):
+        """Let the model request tools, keeping their replies in conversation order."""
+        messages = [
+            {"role": "system", "content": prompts.SYSTEM},
+            *history,
+            {"role": "user", "content": prompts.investigate(goal, self.ledger.select(self._visible))},
+        ]
         for round_number in range(1, self.max_rounds + 1):
             self.on_event("investigating", round=round_number)
             reply = self._chat(exchanges, "investigate", messages, tools=tools)
             if not reply["tool_calls"]:
                 break
-            messages.append({"role": "assistant", "content": reply["content"], "tool_calls": [
-                {"type": "function", "function": {"index": index, "name": call["name"], "arguments": call["arguments"]}}
-                for index, call in enumerate(reply["tool_calls"])]})
+
+            requested_tools = []
+            for index, call in enumerate(reply["tool_calls"]):
+                requested_tools.append({
+                    "type": "function",
+                    "function": {"index": index, "name": call["name"], "arguments": call["arguments"]},
+                })
+            messages.append({
+                "role": "assistant",
+                "content": reply["content"],
+                "tool_calls": requested_tools,
+            })
             for call in reply["tool_calls"]:
-                messages.append({"role": "tool", "tool_name": str(call["name"]), "content": self._execute(call, calls)})
-        answer, withheld, attempts, facts = self._compose(goal, sections, exchanges, history)
-        self.on_event("answered", statements=sum(map(len, answer.values())), withheld=len(withheld))
-        return {
-            "status": "complete", **(self.client.metadata or {}), "prompt_version": prompts.VERSION,
-            "goal": goal, "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "elapsed_seconds": perf_counter() - started, "attempts": len(attempts), "validation_problems": attempts,
-            "tool_definitions": tools, "tool_definitions_sha256": sha256_json(tools),
-            "exchanges": exchanges, "tool_calls": calls, "facts": facts,
-            "model_draft": answer, "answer": deepcopy(answer), "withheld": withheld, "validation": VALIDATION_NOTE,
-            "usage": {key: sum(exchange["usage"].get(key) or 0 for exchange in exchanges) for key in USAGE_KEYS},
-        }
+                messages.append({
+                    "role": "tool",
+                    "tool_name": str(call["name"]),
+                    "content": self._execute(call, calls),
+                })
 
     def _chat(self, exchanges, phase, messages, **options):
+        """Call the model and save the request, response and usage for review."""
         reply = self.client.chat(messages, **options)
         request = dict(reply["request"])
         if "tools" in request:  # stored once as tool_definitions; keep a verifiable reference here
@@ -85,7 +140,10 @@ class Analyst:
 
     def _execute(self, call, calls):
         """Run one model-requested call through the registry; return the tool message text."""
-        name, arguments = call["name"], call["arguments"]
+        name = call["name"]
+        arguments = call["arguments"]
+        # Invalid and repeated calls consume the budget too. Requests beyond the
+        # budget receive an error message without executing or recording a call.
         if len(calls) >= self.max_calls:
             return "ERROR budget_exhausted: the tool budget is used up; stop calling tools and answer."
         envelope = self.registry.call(name, arguments, self.context)
@@ -97,7 +155,9 @@ class Analyst:
         call_id, repeated = self.ledger.record(envelope["tool"], envelope["arguments"], envelope["output"],
                                                origin="model")
         record = self.ledger.call(call_id)
-        self._visible.extend(fact_id for fact_id in record["fact_ids"] if fact_id not in self._visible)
+        for fact_id in record["fact_ids"]:
+            if fact_id not in self._visible:
+                self._visible.append(fact_id)
         calls.append({"id": call_id, "tool": envelope["tool"], "arguments": envelope["arguments"],
                       "repeated": repeated})
         self.on_event("tool", call_id=call_id, name=envelope["tool"], arguments=envelope["arguments"],
@@ -106,11 +166,15 @@ class Analyst:
         return f"{call_id}: {record['title']}{note}\n" + prompts.fact_sheet(self.ledger.select(record["fact_ids"]))
 
     def _compose(self, goal, sections, exchanges, history):
+        """Draft an answer, allow one repair, then retain only validated statements."""
         # A fresh, compact prompt: earlier conversation for context, then every fact the model saw.
         facts = self.ledger.select(self._visible)
         schema = answer_schema(sections, list(facts))
-        messages = [{"role": "system", "content": prompts.SYSTEM}, *history,
-                    {"role": "user", "content": prompts.compose(goal, sections, facts)}]
+        messages = [
+            {"role": "system", "content": prompts.SYSTEM},
+            *history,
+            {"role": "user", "content": prompts.compose(goal, sections, facts)},
+        ]
         attempts = []
         for attempt in range(2):  # one bounded repair; the snapshot is never reread
             self.on_event("composing", attempt=attempt + 1)
@@ -124,8 +188,12 @@ class Analyst:
             if not problems:
                 break
             if attempt == 0:
-                messages += [{"role": "assistant", "content": reply["content"]},
-                             {"role": "user", "content": prompts.repair(problems)}]
+                messages.extend([
+                    {"role": "assistant", "content": reply["content"]},
+                    {"role": "user", "content": prompts.repair(problems)},
+                ])
+        # Other sections may lose unsupported statements; the main answer is
+        # required, so losing it fails the run before report files are replaced.
         if kept is None or not kept["answer"]:
             raise AnalysisError("Model answer failed evidence validation: " + "; ".join(problems[:3]))
         return kept, withheld, attempts, facts
@@ -145,15 +213,27 @@ class ChatSession:
     """Multi-turn questions over one snapshot; recent answers and their evidence carry over."""
 
     def __init__(self, analyst, preload=(), memory=3):
-        self.analyst, self.preload, self.memory, self.turns = analyst, list(preload), memory, []
+        self.analyst = analyst
+        self.preload = list(preload)
+        self.memory = memory
+        self.turns = []
 
     def ask(self, question):
-        history, carried = [], []
+        """Answer using recent successful turns and the facts those answers cited."""
+        history = []
+        carried_fact_ids = []
         for turn in self.turns[-self.memory:]:
-            history += [{"role": "user", "content": turn["question"]},
-                        {"role": "assistant", "content": answer_text(turn["result"]["answer"])}]
-            carried += cited_ids(turn["result"]["answer"])
-        result = self.analyst.run(question, sections=ASK_SECTIONS, preload=[*self.preload, *carried],
-                                  history=history)
+            previous_answer = turn["result"]["answer"]
+            history.extend([
+                {"role": "user", "content": turn["question"]},
+                {"role": "assistant", "content": answer_text(previous_answer)},
+            ])
+            carried_fact_ids.extend(cited_ids(previous_answer))
+        result = self.analyst.run(
+            question,
+            sections=ASK_SECTIONS,
+            preload=[*self.preload, *carried_fact_ids],
+            history=history,
+        )
         self.turns.append({"question": question, "result": result})
         return result
