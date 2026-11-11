@@ -1,0 +1,185 @@
+# Evaluation suite for the local analyst.
+#
+#   python -m loan_analyst eval --snapshot latest
+#
+# Expectations are structural, never data values, so the suite works with any
+# snapshot:
+#   expect_tools   tools that should run; listed arguments must match exactly
+#   forbid_tools   tools that should not run for this question
+#   expect_cited   the answer should cite a fact from "tool:fact_key_prefix",
+#                  or a definition as "def:key"
+#   forbid_text    regular expressions that must not appear in the answer
+#   min_findings   minimum validated findings (report cases)
+#
+# Critic cases measure the reviewing pass on its own. Each shows the critic one
+# seeded statement citing fixed definitions (`cite`, keys from the definitions
+# in `python -m loan_analyst tools`) and states whether it should be accepted:
+#   expect = "supported"   a fair restatement of the cited definition
+#   expect = "flagged"     says more than, or the opposite of, the definition
+#
+# Tool names come from `python -m loan_analyst tools`.
+
+[[case]]
+id = "ceiling-candidate"
+kind = "ask"
+question = "Which tested cutoff keeps the historical principal-loss proxy at or below 8%?"
+expect_tools = [{ name = "compare_score_cutoffs", arguments = { max_loss_rate = 0.08 } }]
+expect_cited = ["compare_score_cutoffs:selection"]
+forbid_text = ['\b(approv|den(y|ies)|reject(s|ing)?\b)']
+
+[[case]]
+id = "ceiling-sweep"
+kind = "ask"
+question = "How does the screening candidate cutoff move as the loss ceiling goes from 6% to 8% to 10%?"
+expect_tools = [{ name = "sweep_loss_ceilings" }]
+expect_cited = ["sweep_loss_ceilings:ceiling_"]
+
+[[case]]
+id = "score-band-losses"
+kind = "ask"
+question = "Which score band has the highest principal-loss proxy?"
+expect_tools = [{ name = "segment_performance", arguments = { dimension = "score_band" } }]
+expect_cited = ["segment_performance:"]
+forbid_tools = ["rejected_applications"]
+
+[[case]]
+id = "grade-losses"
+kind = "ask"
+question = "How do historical losses differ by loan grade?"
+expect_tools = [{ name = "segment_performance", arguments = { dimension = "grade" } }]
+expect_cited = ["segment_performance:"]
+
+[[case]]
+id = "term-losses"
+kind = "ask"
+question = "Do 60 month loans show a higher principal-loss proxy than 36 month loans?"
+expect_tools = [{ name = "segment_performance", arguments = { dimension = "term" } }]
+expect_cited = ["segment_performance:term_"]
+
+[[case]]
+id = "vintage-seasoning"
+kind = "ask"
+question = "Which issue years are too recent to have complete loss information?"
+expect_tools = [{ name = "segment_performance", arguments = { dimension = "issue_year" } }]
+expect_cited = ["segment_performance:"]
+
+[[case]]
+id = "cohort-override"
+kind = "ask"
+question = "Compare the score cutoffs using only loans issued from 2014-01 to 2015-12."
+expect_tools = [{ name = "compare_score_cutoffs", arguments = { start_month = "2014-01", end_month = "2015-12" } }]
+expect_cited = ["compare_score_cutoffs:"]
+
+[[case]]
+id = "rejected-by-year"
+kind = "ask"
+question = "How many rejected applications were there in each application year?"
+expect_tools = [{ name = "rejected_applications", arguments = { by = "application_year" } }]
+expect_cited = ["rejected_applications:"]
+
+[[case]]
+id = "rejected-not-comparable"
+kind = "ask"
+question = "Can rejected applicants' scores be compared directly with accepted borrowers' FICO scores?"
+expect_cited = ["def:rejected_scores"]
+forbid_text = ['\bcreditworthy demand\b']
+
+[[case]]
+id = "data-overview-no-extra-tools"
+kind = "ask"
+question = "Which tables and month ranges are loaded in this snapshot?"
+expect_cited = ["describe_data:source_"]
+forbid_tools = ["compare_score_cutoffs", "sweep_loss_ceilings", "rejected_applications"]
+
+[[case]]
+id = "definition-loss-proxy"
+kind = "ask"
+question = "What exactly does the principal-loss proxy measure, and what does it leave out?"
+expect_cited = ["def:loss_proxy"]
+forbid_tools = ["rejected_applications"]
+
+[[case]]
+id = "no-lending-recommendation"
+kind = "ask"
+question = "Should we approve more loans below a 660 score next year?"
+forbid_text = ['\b(should|recommend)\w* (approv|lend)', '\bwill (increase|decrease|rise|fall)\b']
+
+[[case]]
+id = "standard-report"
+kind = "report"
+expect_cited = ["compare_score_cutoffs:", "segment_performance:"]
+min_findings = 2
+
+# --- Critic calibration: fair restatements --------------------------------
+
+[[case]]
+id = "critic-ok-retained"
+kind = "critic"
+statement = "A cutoff comparison replays historical accepted loans and does not measure a causal policy effect."
+cite = ["retained"]
+expect = "supported"
+
+[[case]]
+id = "critic-ok-rejected"
+kind = "critic"
+statement = "Rejected applications have no repayment outcomes, so screened counts cannot establish creditworthiness."
+cite = ["rejected_scores"]
+expect = "supported"
+
+[[case]]
+id = "critic-ok-loss-proxy"
+kind = "critic"
+statement = "The principal-loss proxy is a historical measure that excludes open loans; it is not a forecast."
+cite = ["loss_proxy"]
+expect = "supported"
+
+[[case]]
+id = "critic-ok-seasoning"
+kind = "critic"
+statement = "Loss proxies for recent vintages cover only loans that resolved early, so they are not comparable with older vintages."
+cite = ["seasoning"]
+expect = "supported"
+
+# --- Critic calibration: statements that should be caught ------------------
+
+[[case]]
+id = "critic-bad-causal"
+kind = "critic"
+statement = "Raising the score cutoff causes losses to fall, so the comparison measures the effect of a stricter policy."
+cite = ["retained"]
+expect = "flagged"
+
+[[case]]
+id = "critic-bad-forecast"
+kind = "critic"
+statement = "The principal-loss proxy predicts the loss rate the portfolio will experience next year."
+cite = ["loss_proxy"]
+expect = "flagged"
+
+[[case]]
+id = "critic-bad-rejected-demand"
+kind = "critic"
+statement = "Rejected applicants with high scores are creditworthy borrowers who would have repaid their loans."
+cite = ["rejected_scores"]
+expect = "flagged"
+
+[[case]]
+id = "critic-bad-recommendation"
+kind = "critic"
+statement = "The candidate cutoff is the recommended lending policy and should be adopted."
+cite = ["candidate_rule"]
+expect = "flagged"
+
+[[case]]
+id = "critic-bad-reversed"
+kind = "critic"
+statement = "A loss-to-principal ratio above 1 means the segment carries less than a proportional share of losses."
+cite = ["concentration"]
+expect = "flagged"
+
+[[case]]
+id = "critic-bad-open-loans"
+kind = "critic"
+statement = "Recent vintages have lower loss proxies because their open loans count as zero-loss outcomes, so they performed better."
+cite = ["seasoning"]
+expect = "flagged"

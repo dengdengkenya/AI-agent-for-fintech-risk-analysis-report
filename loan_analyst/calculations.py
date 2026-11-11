@@ -7,8 +7,9 @@ Read one section at a time:
   3. Score cutoffs             compare_cutoffs(), cutoff_facts(), sweep
   4. Segment breakdowns        analyze_segments(), segment_facts()
   5. Rejected applications     analyze_rejected(), rejected_facts()
-  6. Citable definitions       DEFINITIONS
-  7. Tool catalog              schemas, handlers, build_registry()
+  6. Portfolio risk views      analyze_vintages(), analyze_concentration(), analyze_mix()
+  7. Citable definitions       DEFINITIONS
+  8. Tool catalog              schemas, handlers, build_registry()
 
 Each analysis follows the same shape:
 
@@ -505,20 +506,20 @@ def band_label(band, cutoffs):
     return f"{band}-{cutoffs[index + 1] - 1}"
 
 
-def analyze_segments(snapshot, scenario, dimension, min_score=None):
-    """Filter the cohort, group its rows, then calculate each group's share and rates."""
-    cube = snapshot.cubes[ACCEPTED]
+def require_dimension(cube, dimension):
+    """Refuse an unknown dimension, or one whose optional column this snapshot lacks."""
     if dimension not in TITLES:
         raise ValueError(f"Unknown dimension: {dimension}")
     if dimension in ("grade", "term") and dimension not in cube.dimensions:
         raise ToolUnavailable(f"{dimension} is unavailable: the accepted table has no {dimension} column")
 
-    rows = cube.select(scenario.start_month, scenario.end_month, min_score=min_score)
 
+def group_by_dimension(rows, dimension, cutoffs):
+    """Split in-cohort rows into disjoint segments; return [(label, rows)] in display order."""
     groups = {}
     for row in rows:
         if dimension == "score_band":
-            key = bucket(row["score"], scenario.cutoffs)
+            key = bucket(row["score"], cutoffs)
         elif dimension == "issue_year":
             key = row["period"][:4]
         else:
@@ -532,18 +533,29 @@ def analyze_segments(snapshot, scenario, dimension, min_score=None):
     else:
         ordered_keys = sorted(groups, key=lambda key: (key == MISSING, key))
 
-    loans = sum(row["rows"] for row in rows)
-    segments = []
+    labelled = []
     for key in ordered_keys:
-        group_totals = total(groups[key])
-
         if dimension == "score_band":
-            label = band_label(key, scenario.cutoffs)
+            label = band_label(key, cutoffs)
         elif dimension == "term" and key != MISSING:
             label = f"{key} months"
         else:
             label = str(key)
+        labelled.append((label, groups[key]))
+    return labelled
 
+
+def analyze_segments(snapshot, scenario, dimension, min_score=None):
+    """Filter the cohort, group its rows, then calculate each group's share and rates."""
+    cube = snapshot.cubes[ACCEPTED]
+    require_dimension(cube, dimension)
+
+    rows = cube.select(scenario.start_month, scenario.end_month, min_score=min_score)
+
+    loans = sum(row["rows"] for row in rows)
+    segments = []
+    for label, group_rows in group_by_dimension(rows, dimension, scenario.cutoffs):
+        group_totals = total(group_rows)
         segments.append({
             "segment": label,
             "accepted": group_totals,
@@ -715,7 +727,361 @@ def rejected_facts(result):
 
 
 # ===========================================================================
-# 5. Citable definitions
+# 5. Portfolio risk views: vintage trend, loss concentration, origination mix
+# ===========================================================================
+#
+# The model cannot do arithmetic it is allowed to quote, so every comparison a
+# reader might want (a change in percentage points, a share, a ratio) is
+# calculated here and written into a fact.
+
+PERIODS = {"year": "issue year", "quarter": "issue quarter"}
+DEFAULT_SEASONING = 0.8
+MIX_DIMENSIONS = ("score_band", "grade", "term")
+LISTED_VINTAGES = 12  # longest list of vintage names written into one fact
+
+
+def vintage_key(month, period):
+    """'2015-08' -> '2015' or '2015-Q3'."""
+    if period == "year":
+        return month[:4]
+    return f"{month[:4]}-Q{(int(month[5:7]) - 1) // 3 + 1}"
+
+
+def analyze_vintages(snapshot, scenario, period="year", min_terminal_share=DEFAULT_SEASONING, min_score=None):
+    """Performance by issue vintage, separating seasoned vintages from mostly open ones.
+
+    A vintage is "seasoned" when its terminal share reaches the threshold. Loss
+    proxies of unseasoned vintages cover only the loans that resolved early, so
+    only seasoned vintages are compared with each other.
+    """
+    if period not in PERIODS:
+        raise ValueError(f"Unknown period: {period}")
+    rows = snapshot.cubes[ACCEPTED].select(scenario.start_month, scenario.end_month, min_score=min_score)
+
+    groups = {}
+    for row in rows:
+        groups.setdefault(vintage_key(row["period"], period), []).append(row)
+
+    loans = sum(row["rows"] for row in rows)
+    vintages = []
+    for key in sorted(groups):
+        group_totals = total(groups[key])
+        rates = performance(group_totals, scenario.min_outcomes)
+        terminal_share = rates["terminal_share"]
+        vintages.append({
+            "vintage": key,
+            "accepted": group_totals,
+            "loan_share": ratio(group_totals["rows"], loans),
+            **rates,
+            "seasoned": terminal_share is not None and terminal_share >= min_terminal_share,
+        })
+
+    # Only seasoned vintages with a displayable loss proxy can be compared.
+    comparable = [vintage for vintage in vintages if vintage["seasoned"] and vintage["loss_rate"] is not None]
+    change = None
+    if len(comparable) >= 2:
+        first, last = comparable[0], comparable[-1]
+        change = {
+            "first": first["vintage"], "first_loss_rate": first["loss_rate"],
+            "last": last["vintage"], "last_loss_rate": last["loss_rate"],
+            "change_pp": (last["loss_rate"] - first["loss_rate"]) * 100,
+        }
+
+    return {
+        "period": period,
+        "min_terminal_share": min_terminal_share,
+        "min_score": min_score,
+        "cohort": scenario.cohort,
+        "min_outcomes": scenario.min_outcomes,
+        "loans": loans,
+        "vintages": vintages,
+        "comparable": [vintage["vintage"] for vintage in comparable],
+        "seasoned_change": change,
+    }
+
+
+def vintage_facts(result):
+    name = PERIODS[result["period"]]
+    threshold = pct(result["min_terminal_share"])
+    scope = "all loans in the cohort" if result["min_score"] is None else (
+        f"loans with a valid score at or above {result['min_score']}")
+    facts = {"scope": (
+        f"Vintage trend by {name}: cohort {result['cohort']}; {scope}; {result['loans']:,} loans. A vintage counts "
+        f"as seasoned when at least {threshold} of its loans are resolved (Fully Paid or Charged Off). This "
+        "threshold is a reporting choice, not a statistical test, and vintages are descriptive groups, not causes."
+    )}
+
+    vintages = result["vintages"]
+    for vintage in vintages:
+        status = "seasoned" if vintage["seasoned"] else "not seasoned, so its rates cover only resolved loans"
+        facts[f"vintage_{slug(vintage['vintage'])}"] = (
+            f"{name.capitalize()} {vintage['vintage']}: {vintage['accepted']['rows']:,} loans; terminal share "
+            f"{pct(vintage['terminal_share'])}; charge-off rate {pct(vintage['chargeoff_rate'])}; principal-loss "
+            f"proxy {pct(vintage['loss_rate'])}; {status}."
+        )
+
+    by_name = {vintage["vintage"]: vintage for vintage in vintages}
+    comparable = [by_name[key] for key in result["comparable"]]
+    if len(comparable) >= 2:
+        high = max(comparable, key=lambda vintage: vintage["loss_rate"])
+        low = min(comparable, key=lambda vintage: vintage["loss_rate"])
+        facts["seasoned_range"] = (
+            f"Among the {len(comparable)} seasoned vintages with enough outcomes, the highest principal-loss proxy "
+            f"is {high['vintage']} at {pct(high['loss_rate'])} and the lowest is {low['vintage']} at "
+            f"{pct(low['loss_rate'])}."
+        )
+        change = result["seasoned_change"]
+        if abs(change["change_pp"]) < .005:
+            movement = "is unchanged at the displayed precision"
+        else:
+            movement = (f"is {'higher' if change['change_pp'] > 0 else 'lower'} by "
+                        f"{abs(change['change_pp']):.2f} percentage points")
+        facts["seasoned_change"] = (
+            f"From the earliest seasoned vintage {change['first']} to the latest seasoned vintage {change['last']}, "
+            f"the principal-loss proxy {movement} ({pct(change['first_loss_rate'])} versus "
+            f"{pct(change['last_loss_rate'])}). Differences in loan age and mix are not controlled."
+        )
+    else:
+        facts["seasoned_range"] = (
+            f"Fewer than two vintages are seasoned at the {threshold} threshold with enough outcomes, so no "
+            "vintage-to-vintage loss comparison is made."
+        )
+
+    unseasoned = [vintage["vintage"] for vintage in vintages if not vintage["seasoned"]]
+    if unseasoned:
+        shown = ", ".join(unseasoned[:LISTED_VINTAGES])
+        if len(unseasoned) > LISTED_VINTAGES:
+            shown += " and later ones"
+        facts["unseasoned"] = (
+            f"{len(unseasoned)} of {len(vintages)} vintages are below the {threshold} seasoning threshold: {shown}. "
+            "Their loss proxies cover only loans that resolved early and should not be compared with seasoned "
+            "vintages."
+        )
+    else:
+        facts["unseasoned"] = f"All {len(vintages)} vintages meet the {threshold} seasoning threshold."
+    return facts
+
+
+def vintage_highlights(facts):
+    return tuple(key for key in ("scope", "seasoned_range", "seasoned_change", "unseasoned") if key in facts)
+
+
+def analyze_concentration(snapshot, scenario, dimension, min_score=None):
+    """Where historical unrecovered principal sits, compared with where principal was funded.
+
+    Both shares use financially complete terminal loans only, the same population
+    as the principal-loss proxy. A segment whose loss share exceeds its principal
+    share carries more than a proportional part of the losses.
+    """
+    cube = snapshot.cubes[ACCEPTED]
+    require_dimension(cube, dimension)
+    rows = cube.select(scenario.start_month, scenario.end_month, min_score=min_score)
+
+    overall = total(rows)
+    segments = []
+    for label, group_rows in group_by_dimension(rows, dimension, scenario.cutoffs):
+        group_totals = total(group_rows)
+        principal_share = ratio(group_totals["performance_principal"], overall["performance_principal"])
+        loss_share = ratio(group_totals["loss_amount"], overall["loss_amount"])
+
+        relative = None
+        if principal_share and loss_share is not None and group_totals["performance_rows"] >= scenario.min_outcomes:
+            relative = loss_share / principal_share
+
+        segments.append({
+            "segment": label,
+            "complete_loans": group_totals["performance_rows"],
+            "principal": group_totals["performance_principal"],
+            "loss_amount": group_totals["loss_amount"],
+            "principal_share": principal_share,
+            "loss_share": loss_share,
+            "loss_to_principal_ratio": relative,
+        })
+
+    # Largest contributors first; ties keep display order.
+    ranked = sorted((segment for segment in segments if segment["loss_share"]),
+                    key=lambda segment: -segment["loss_share"])
+    top = []
+    cumulative = 0.0
+    for segment in ranked[:3]:
+        cumulative += segment["loss_share"]
+        top.append({"segment": segment["segment"], "loss_share": segment["loss_share"],
+                    "cumulative_loss_share": cumulative})
+
+    return {
+        "dimension": dimension,
+        "min_score": min_score,
+        "cohort": scenario.cohort,
+        "min_outcomes": scenario.min_outcomes,
+        "complete_loans": overall["performance_rows"],
+        "principal": overall["performance_principal"],
+        "loss_amount": overall["loss_amount"],
+        "segments": segments,
+        "top": top,
+    }
+
+
+def concentration_facts(result):
+    name = TITLES[result["dimension"]]
+    scope = "all loans in the cohort" if result["min_score"] is None else (
+        f"loans with a valid score at or above {result['min_score']}")
+    facts = {"scope": (
+        f"Loss concentration by {name.lower()}: cohort {result['cohort']}; {scope}. Shares use the "
+        f"{result['complete_loans']:,} financially complete Fully Paid or Charged Off loans, with "
+        f"{usd(result['principal'])} funded principal and {usd(result['loss_amount'])} unrecovered principal. "
+        "Open loans are excluded. Shares show where historical losses sit; they are not limits, causes or forecasts."
+    )}
+
+    for segment in result["segments"]:
+        relative = segment["loss_to_principal_ratio"]
+        comparison = ("the ratio of loss share to principal share is N/A" if relative is None
+                      else f"its loss share is {relative:.2f} times its principal share")
+        facts[f"{slug(name)}_{slug(segment['segment'])}"] = (
+            f"{name} {segment['segment']}: {pct(segment['principal_share'])} of funded principal and "
+            f"{pct(segment['loss_share'])} of unrecovered principal among complete terminal loans; {comparison}."
+        )
+
+    top = result["top"]
+    if top:
+        text = (f"The largest contributor to unrecovered principal is {name.lower()} {top[0]['segment']} with "
+                f"{pct(top[0]['loss_share'])}.")
+        if len(top) > 1:
+            names = ", ".join(item["segment"] for item in top)
+            text += (f" The {len(top)} largest contributors ({names}) together hold "
+                     f"{pct(top[-1]['cumulative_loss_share'])}.")
+        facts["top"] = text
+    else:
+        facts["top"] = "No unrecovered principal is recorded for this view, so loss shares are unavailable."
+
+    rated = [segment for segment in result["segments"] if segment["loss_to_principal_ratio"] is not None]
+    if len(rated) >= 2:
+        high = max(rated, key=lambda segment: segment["loss_to_principal_ratio"])
+        low = min(rated, key=lambda segment: segment["loss_to_principal_ratio"])
+        facts["overweight"] = (
+            f"Relative to funded principal, {name.lower()} {high['segment']} carries the most loss "
+            f"({high['loss_to_principal_ratio']:.2f} times its principal share) and {low['segment']} the least "
+            f"({low['loss_to_principal_ratio']:.2f} times), among segments with at least "
+            f"{result['min_outcomes']} complete outcomes."
+        )
+    return facts
+
+
+def concentration_highlights(facts):
+    return tuple(key for key in ("scope", "top", "overweight") if key in facts)
+
+
+def average_score(rows):
+    """Loan-weighted average of valid scores; None when no row has a valid score."""
+    scored = [row for row in rows if row["score"] is not None]
+    loans = sum(row["rows"] for row in scored)
+    return ratio(math.fsum(row["score"] * row["rows"] for row in scored), loans)
+
+
+def analyze_mix(snapshot, scenario, dimension):
+    """How the make-up of issued loans changes from one issue year to the next.
+
+    This counts every issued loan in the cohort, open or resolved, so it is not
+    affected by seasoning. It describes composition only, not performance.
+    """
+    cube = snapshot.cubes[ACCEPTED]
+    if dimension not in MIX_DIMENSIONS:
+        raise ValueError(f"Unknown dimension: {dimension}")
+    require_dimension(cube, dimension)
+    rows = cube.select(scenario.start_month, scenario.end_month)
+
+    # One fixed list of segments, so every year shows the same columns.
+    labels = [label for label, _ in group_by_dimension(rows, dimension, scenario.cutoffs)]
+
+    years = []
+    for year, year_rows in group_by_dimension(rows, "issue_year", scenario.cutoffs):
+        loans = sum(row["rows"] for row in year_rows)
+        by_label = dict(group_by_dimension(year_rows, dimension, scenario.cutoffs))
+        segments = []
+        for label in labels:
+            segment_loans = sum(row["rows"] for row in by_label.get(label, []))
+            segments.append({"segment": label, "rows": segment_loans, "loan_share": ratio(segment_loans, loans)})
+        years.append({"year": year, "loans": loans, "average_score": average_score(year_rows),
+                      "segments": segments})
+
+    changes = []
+    score_change = None
+    if len(years) >= 2:
+        first, last = years[0], years[-1]
+        for before, after in zip(first["segments"], last["segments"]):
+            changes.append({
+                "segment": before["segment"],
+                "first_share": before["loan_share"],
+                "last_share": after["loan_share"],
+                "change_pp": (after["loan_share"] - before["loan_share"]) * 100,
+            })
+        if first["average_score"] is not None and last["average_score"] is not None:
+            score_change = last["average_score"] - first["average_score"]
+
+    return {
+        "dimension": dimension,
+        "cohort": scenario.cohort,
+        "loans": sum(year["loans"] for year in years),
+        "segments": labels,
+        "years": years,
+        "first_year": years[0]["year"] if years else None,
+        "last_year": years[-1]["year"] if years else None,
+        "changes": changes,
+        "average_score_change": score_change,
+    }
+
+
+def _score(value):
+    return "N/A" if value is None else f"{value:.1f}"
+
+
+def mix_facts(result):
+    name = TITLES[result["dimension"]]
+    facts = {"scope": (
+        f"Origination mix by {name.lower()} and issue year: cohort {result['cohort']}; {result['loans']:,} issued "
+        "loans, open and resolved alike. Shares are of each year's issued loan count. A changing mix describes "
+        "what was originated; it does not by itself explain or predict losses."
+    )}
+
+    for year in result["years"]:
+        mix = ", ".join(f"{segment['segment']} {pct(segment['loan_share'])}" for segment in year["segments"])
+        facts[f"year_{year['year']}"] = (
+            f"Issue year {year['year']}: {year['loans']:,} issued loans; loan-weighted average score "
+            f"{_score(year['average_score'])}; {name.lower()} mix: {mix}."
+        )
+
+    first, last = result["first_year"], result["last_year"]
+    for change in result["changes"]:
+        facts[f"change_{slug(change['segment'])}"] = (
+            f"{name} {change['segment']} was {pct(change['first_share'])} of issued loans in {first} and "
+            f"{pct(change['last_share'])} in {last}, a change of {change['change_pp']:+.2f} percentage points."
+        )
+
+    if result["changes"]:
+        largest = max(result["changes"], key=lambda change: abs(change["change_pp"]))
+        facts["largest_shift"] = (
+            f"Between issue years {first} and {last}, the largest change in mix is {name.lower()} "
+            f"{largest['segment']}: {pct(largest['first_share'])} to {pct(largest['last_share'])} of issued loans "
+            f"({largest['change_pp']:+.2f} percentage points)."
+        )
+    else:
+        facts["largest_shift"] = "The cohort holds fewer than two issue years, so no change in mix is calculated."
+
+    if result["average_score_change"] is not None:
+        years = result["years"]
+        facts["average_score"] = (
+            f"The loan-weighted average score of issued loans was {_score(years[0]['average_score'])} in {first} "
+            f"and {_score(years[-1]['average_score'])} in {last}, a change of "
+            f"{result['average_score_change']:+.1f} points. Loans without a valid score are excluded."
+        )
+    return facts
+
+
+def mix_highlights(facts):
+    return tuple(key for key in ("scope", "largest_shift", "average_score") if key in facts)
+
+
+# ===========================================================================
+# 6. Citable definitions
 # ===========================================================================
 
 DEFINITIONS = {
@@ -748,11 +1114,26 @@ DEFINITIONS = {
         "fail the numeric screen and establish score-system comparability before interpreting demand; review "
         "excluded terminal financial records and loan-age differences before comparing performance."
     ),
+    "seasoning": (
+        "Seasoning: recent issue vintages have a low terminal share because most of their loans were still open "
+        "in the source data. Their charge-off rates and loss proxies cover only loans that resolved early, so "
+        "they are not comparable with older, mostly resolved vintages."
+    ),
+    "concentration": (
+        "Loss concentration compares each segment's share of unrecovered principal with its share of funded "
+        "principal, among financially complete terminal loans. A ratio above 1 means the segment carries more "
+        "than a proportional share of historical losses. It is descriptive, not a limit breach or a forecast."
+    ),
+    "mix": (
+        "Origination mix is the share of each issue year's issued loans in each segment. A shift in mix can "
+        "change portfolio-level rates even when segment-level rates are stable; it does not by itself explain "
+        "or predict losses."
+    ),
 }
 
 
 # ===========================================================================
-# 6. Tool parameters, handlers and the catalog
+# 7. Tool parameters, handlers and the catalog
 # ===========================================================================
 
 # Omitted or null tool arguments use the session's settings.
@@ -838,6 +1219,36 @@ def rejected_applications_tool(context, by="score_era", **arguments):
                       result, facts, tuple(facts))
 
 
+MIN_SCORE_PARAM = {"min_score": {
+    "type": "integer", "minimum": 300, "maximum": 850,
+    "description": "Only loans with a valid score at or above this cutoff. Omit for all loans in the cohort."}}
+
+
+def vintage_trend_tool(context, period="year", min_terminal_share=DEFAULT_SEASONING, min_score=None,
+                       **arguments):
+    scenario = scenario_for(context, arguments)
+    result = analyze_vintages(context.snapshot, scenario, period, min_terminal_share, min_score)
+    facts = vintage_facts(result)
+    return ToolOutput(f"Vintage trend by {PERIODS[period]}, cohort {scenario.cohort}", result, facts,
+                      vintage_highlights(facts))
+
+
+def loss_concentration_tool(context, dimension, min_score=None, **arguments):
+    scenario = scenario_for(context, arguments)
+    result = analyze_concentration(context.snapshot, scenario, dimension, min_score)
+    facts = concentration_facts(result)
+    return ToolOutput(f"Loss concentration by {TITLES[dimension].lower()}, cohort {scenario.cohort}", result,
+                      facts, concentration_highlights(facts))
+
+
+def mix_shift_tool(context, dimension, **arguments):
+    scenario = scenario_for(context, arguments)
+    result = analyze_mix(context.snapshot, scenario, dimension)
+    facts = mix_facts(result)
+    return ToolOutput(f"Origination mix by {TITLES[dimension].lower()} and issue year, cohort {scenario.cohort}",
+                      result, facts, mix_highlights(facts))
+
+
 TOOLS = (
     Tool("describe_data",
          "Describe the loaded MySQL snapshot: source tables, row counts, parseable month ranges, optional "
@@ -889,6 +1300,43 @@ TOOLS = (
                                "description": "How to group applications."},
                         **CUTOFF_PARAMS, **COHORT_PARAMS}),
          rejected_applications_tool),
+
+    Tool("vintage_trend",
+         "Compare historical accepted-loan performance across issue vintages (year or quarter), marking which "
+         "vintages are seasoned enough to compare. Returns each vintage's terminal share, charge-off rate and "
+         "principal-loss proxy, the highest and lowest seasoned vintages, and the change between the earliest "
+         "and latest seasoned vintage in percentage points.",
+         object_schema({
+             "period": {"type": "string", "enum": list(PERIODS), "description": "Vintage size. Default year."},
+             "min_terminal_share": {"type": "number", "minimum": 0, "maximum": 1,
+                                    "description": "Share of a vintage's loans that must be resolved for it to "
+                                                   "count as seasoned, as a fraction. Default 0.8."},
+             **MIN_SCORE_PARAM, **COHORT_PARAMS, **MIN_OUTCOMES_PARAM,
+         }),
+         vintage_trend_tool),
+
+    Tool("loss_concentration",
+         "Show where historical unrecovered principal is concentrated: each segment's share of losses versus its "
+         "share of funded principal (complete terminal loans), the largest contributors and the segments that "
+         "carry more or less than a proportional share. Segment by score_band, issue_year, grade or term.",
+         object_schema({
+             "dimension": {"type": "string", "enum": list(TITLES), "description": "How to segment the loans."},
+             "cutoffs": CUTOFF_PARAMS["cutoffs"],
+             **MIN_SCORE_PARAM, **COHORT_PARAMS, **MIN_OUTCOMES_PARAM,
+         }, required=["dimension"]),
+         loss_concentration_tool),
+
+    Tool("mix_shift",
+         "Show how the mix of issued loans changes by issue year: each year's share of loans by score_band, grade "
+         "or term, the loan-weighted average score, and the change in each share between the first and last "
+         "issue year in percentage points. Counts all issued loans, so seasoning does not affect it.",
+         object_schema({
+             "dimension": {"type": "string", "enum": list(MIX_DIMENSIONS),
+                           "description": "Which mix to follow across issue years."},
+             "cutoffs": CUTOFF_PARAMS["cutoffs"],
+             **COHORT_PARAMS,
+         }, required=["dimension"]),
+         mix_shift_tool),
 )
 
 

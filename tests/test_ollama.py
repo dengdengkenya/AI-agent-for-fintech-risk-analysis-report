@@ -98,6 +98,27 @@ class OllamaClientTests(unittest.TestCase):
                     installed, {"capabilities": ["completion", "tools"], **details}, {"version": "test"}]):
                 self.assertEqual(self.client.preflight()["server_version"], "test")
 
+    def test_preflight_records_the_context_window_and_rejects_a_larger_num_ctx(self):
+        installed = {"models": [{"name": self.client.config.model, "size": 100}]}
+        details = {"capabilities": ["completion", "tools"], "model_info": {"qwen3.context_length": 32768}}
+        with patch.object(llm, "request_json", side_effect=[installed, details, {"version": "test"}]):
+            self.assertEqual(self.client.preflight()["context_length"], 32768)
+        client = llm.OllamaClient(ModelConfig(num_ctx=65536))
+        with patch.object(llm, "request_json", side_effect=[installed, details]), \
+             self.assertRaisesRegex(llm.ModelError, "--num-ctx 32768 or less"):
+            client.preflight()
+
+    def test_only_timeouts_connection_and_server_errors_are_marked_transient(self):
+        cases = ((TimeoutError(), True), (URLError("refused"), True),
+                 (HTTPError("http://localhost", 503, "", {}, io.BytesIO(b"")), True),
+                 (HTTPError("http://localhost", 404, "", {}, io.BytesIO(b"")), False))
+        for error, transient in cases:
+            with self.subTest(error=error), patch.object(llm, "build_opener") as build:
+                build.return_value.open.side_effect = error
+                with self.assertRaises(llm.ModelError) as raised:
+                    llm.request_json("http://localhost:11434", "/api/chat")
+                self.assertEqual(raised.exception.transient, transient)
+
     def test_token_limit_discards_partial_tools_and_gives_safe_recovery_hint(self):
         partial = response("private partial content", [{"function": {
             "name": "describe_data", "arguments": {}}}], done_reason="length")

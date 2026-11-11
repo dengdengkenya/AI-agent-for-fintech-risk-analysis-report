@@ -23,6 +23,7 @@ from .database import quote_identifier
 MONTH_PATTERN = "[12][0-9]{3}-(0[1-9]|1[0-2])"
 DEFAULT_CUTOFFS = (600, 640, 660, 680, 700, 720, 740)
 DEFAULT_MODEL = "qwen3:4b-instruct-2507-q4_K_M"
+TOOL_MODES = ("native", "schema")
 
 
 class SettingsError(ValueError):
@@ -213,13 +214,16 @@ class ModelConfig:
     model = DEFAULT_MODEL  # class-level default so error messages can name it
 
     def __init__(self, url="http://localhost:11434", model=DEFAULT_MODEL, timeout=300,
-                 keep_alive="5m", num_ctx=16384, max_tool_rounds=4, max_tool_calls=8):
+                 keep_alive="5m", num_ctx=16384, max_tool_rounds=4, max_tool_calls=8,
+                 max_model_calls=40, tool_mode="native", critic=True):
         url = local_url(url)
+        require(tool_mode in TOOL_MODES, f"tool_mode must be one of: {', '.join(TOOL_MODES)}")
+        require(type(critic) is bool, "critic must be true or false")
         require(isinstance(model, str) and model.strip(), "model must be a nonempty model tag")
         require(isinstance(keep_alive, str) and keep_alive,
                 "keep_alive must be a duration such as 5m")
         for name, value in (("timeout", timeout), ("num_ctx", num_ctx),
-                            ("max_tool_calls", max_tool_calls)):
+                            ("max_tool_calls", max_tool_calls), ("max_model_calls", max_model_calls)):
             require(is_plain_integer(value) and value >= 1, f"{name} must be a positive integer")
         require(is_plain_integer(max_tool_rounds) and 0 <= max_tool_rounds <= 10,
                 "max_tool_rounds must be an integer from 0 to 10")
@@ -231,13 +235,19 @@ class ModelConfig:
         self.num_ctx = num_ctx
         self.max_tool_rounds = max_tool_rounds
         self.max_tool_calls = max_tool_calls
+        self.max_model_calls = max_model_calls
+        # "native" uses the model's own tool-call format; "schema" asks for a JSON
+        # list of calls under a structured-output schema instead.
+        self.tool_mode = tool_mode
+        self.critic = critic  # a second model pass that reviews each statement
 
 
 CONFIG_KEYS = {
     "database": {"host", "port", "user", "database", "accepted_table", "rejected_table", "query_timeout"},
     "scenario": {"cutoffs", "baseline", "start_month", "end_month", "max_loss_rate", "min_outcomes",
                  "assume_comparable_scores", "rejected_loss_rate", "take_up_rate"},
-    "model": {"url", "model", "timeout", "keep_alive", "num_ctx", "max_tool_rounds", "max_tool_calls"},
+    "model": {"url", "model", "timeout", "keep_alive", "num_ctx", "max_tool_rounds", "max_tool_calls",
+              "max_model_calls", "tool_mode", "critic"},
     "report": {"output_dir", "sections"},
 }
 

@@ -12,11 +12,11 @@ from loan_analyst import PROJECT_ROOT, calculations, cli
 from loan_analyst.snapshot import Snapshot, save_snapshot
 from loan_analyst.ollama import ModelError
 from loan_analyst.settings import ModelConfig
-from tests.fixtures import (FakeConnection, ScriptedModel, calls, done, grounded, make_snapshot, scenario, services,
-                            statement, temporary_directory)
+from tests.fixtures import (FakeConnection, ScriptedModel, auto, broken, calls, done, grounded, make_snapshot,
+                            scenario, services, statement, temporary_directory)
 
 ARGS = ["--cutoffs", "600,700", "--baseline", "700", "--min-outcomes", "1", "--start-month", "2013-01"]
-FILES = ("report.md", "aggregates.json", "snapshot.json", "ollama_analysis.json")
+FILES = ("report.md", "aggregates.json", "snapshot.json", "ollama_analysis.json", "trace.jsonl")
 
 
 class MissingModel:
@@ -39,7 +39,7 @@ class WorkflowTests(unittest.TestCase):
     def test_report_keeps_configuration_scans_once_and_records_the_investigation(self):
         folder = temporary_directory(self, "report-test-") / "live"
         connection = FakeConnection(tables={"loan_inputs": "accepted", "request_inputs": "rejected"})
-        model = ScriptedModel([calls(("compare_score_cutoffs", {"start_month": "2014-01"})), done(), grounded])
+        model = ScriptedModel([calls(("compare_score_cutoffs", {"start_month": "2014-01"}))], default=auto)
         wired = services(self, connection=connection, model=model)
         code, _ = self.run_cli(["report", "--host", "configured-host", "--port", "3307", "--user", "report-reader",
                                 "--database", "custom_loans", "--accepted-table", "loan_inputs", "--rejected-table",
@@ -68,7 +68,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(analysis["tool_results"][0]["arguments"], {"start_month": "2014-01"})
         report = (folder / "report.md").read_text(encoding="utf-8")
         for text in ("Historical MySQL aggregate analysis", "## Analyst summary", "## Loss by score band",
-                     "## Performance by issue year", "## How this analysis was produced", "| t8 | analyst |",
+                     "## Performance by issue year", "## Vintage trend and seasoning", "## Loss concentration",
+                     "## Origination mix by issue year", "## How this analysis was produced", "| t12 | analyst |",
                      "## Evidence cited", 'id="evidence-1"'):
             self.assertIn(text, report)
 
@@ -110,20 +111,79 @@ class WorkflowTests(unittest.TestCase):
         for name in FILES:
             (folder / name).write_text("previous successful run", encoding="utf-8")
         connection = FakeConnection()
-        wired = services(self, connection=connection, model=ScriptedModel([done(), {"content": "{"},
-                                                                           {"content": "{"}]))
+        wired = services(self, connection=connection, model=ScriptedModel([], default=broken))
         code, stderr = self.run_cli(["report", *ARGS, "--output-dir", str(folder)], wired)
         self.assertEqual(code, 1)
         self.assertIn("failed evidence validation", stderr)
         self.assertTrue(connection.closed)
         for name in FILES:
             self.assertEqual((folder / name).read_text(encoding="utf-8"), "previous successful run")
-        rerun = services(self, connection=None, model=ScriptedModel([done(), grounded]))
+        rerun = services(self, connection=None, model=ScriptedModel([], default=auto))
         rerun.snapshot_dir = wired.snapshot_dir
         code, _ = self.run_cli(["report", *ARGS, "--snapshot", "latest", "--output-dir", str(folder)], rerun)
         self.assertEqual(code, 0)
         self.assertIn("loaded from saved file", (folder / "report.md").read_text(encoding="utf-8"))
         self.assertTrue(any("MySQL is not queried" in line for line in rerun.logged))
+
+    def test_interrupted_report_resumes_from_its_journal_without_mysql_or_repeated_model_calls(self):
+        def unavailable(payload):
+            raise ModelError("Ollama HTTP 400; check the local model and server")
+
+        folder = temporary_directory(self, "report-test-") / "resumed"
+        first = services(self, connection=FakeConnection(), model=ScriptedModel([
+            calls(("describe_data", {"end_month": "2015-12"})), done(), unavailable]))
+        code, stderr = self.run_cli(["report", *ARGS, "--output-dir", str(folder)], first)
+        self.assertEqual(code, 1)
+        self.assertFalse(folder.exists())
+        journal = next(first.runs_dir.glob("*/journal.jsonl"))
+        run_id = journal.parent.name
+        self.assertTrue(any(f"report --resume {run_id}" in line for line in first.logged))
+
+        def resumed(model, *extra):
+            wired = services(self, connection=None, model=model)
+            wired.snapshot_dir, wired.runs_dir = first.snapshot_dir, first.runs_dir
+            code, stderr = self.run_cli(["report", *ARGS, "--resume", *extra, "--output-dir", str(folder)], wired)
+            return wired, code, stderr
+
+        # Changed inputs make the saved replies invalid; the journal is left untouched.
+        _, code, stderr = resumed(ScriptedModel([]), "--max-tool-calls", "3")
+        self.assertEqual(code, 1)
+        self.assertIn("max_tool_calls", stderr)
+        _, code, stderr = resumed(ScriptedModel([]), "--snapshot", "latest")
+        self.assertIn("omit --snapshot", stderr)
+
+        model = ScriptedModel([], default=auto)  # only the unfinished work is requested again
+        wired, code, _ = resumed(model)
+        self.assertEqual(code, 0)
+        self.assertNotIn("tools", model.requests[0])  # the two investigation turns were not repeated
+        self.assertTrue(any("MySQL is not queried" in line for line in wired.logged))
+        analysis, evidence = self.read(folder, "ollama_analysis.json"), self.read(folder, "aggregates.json")
+        self.assertEqual((analysis["run_id"], evidence["run_id"]), (run_id, run_id))
+        self.assertEqual(analysis["replayed_model_calls"], 2)
+        self.assertEqual([exchange.get("replayed", False) for exchange in analysis["exchanges"]],
+                         [True, True] + [False] * len(model.requests))
+        self.assertEqual(analysis["tool_results"][0]["arguments"], {"end_month": "2015-12"})
+        self.assertFalse(journal.exists())
+
+        trace = [json.loads(line) for line in (folder / "trace.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(trace[0]["trace_id"], run_id)
+        names = [span["name"] for span in trace[1:]]
+        self.assertEqual(names[:3], ["snapshot", "standard analyses", "analyst"])
+        self.assertIn("execute_tool describe_data", names)
+        self.assertNotIn("Higher cutoffs", json.dumps(trace))  # metadata only, never model text
+        shown = services(self)
+        self.assertEqual(self.run_cli(["trace", str(folder)], shown)[0], 0)
+        self.assertIn("replayed from journal", shown.printed[0])
+        self.assertIn("chat write:tradeoff", shown.printed[0])
+
+    def test_validation_failures_leave_no_journal_and_resume_reports_nothing_to_do(self):
+        wired = services(self, connection=FakeConnection(), model=ScriptedModel([], default=broken))
+        folder = temporary_directory(self, "report-test-")
+        self.assertEqual(self.run_cli(["report", *ARGS, "--output-dir", str(folder)], wired)[0], 1)
+        self.assertEqual(list(wired.runs_dir.glob("*/journal.jsonl")), [])
+        code, stderr = self.run_cli(["report", *ARGS, "--resume", "--output-dir", str(folder)], wired)
+        self.assertEqual(code, 1)
+        self.assertIn("No interrupted run", stderr)
 
     def test_missing_model_fails_before_any_database_scan(self):
         folder = temporary_directory(self, "report-test-") / "absent"
@@ -177,7 +237,7 @@ class WorkflowTests(unittest.TestCase):
         folder = temporary_directory(self, "ask-test-")
         model = ScriptedModel([calls(("segment_performance", {"dimension": "grade"})), done(),
                                lambda payload: grounded(payload, answer=[statement(
-                                   "Grade C has a 40.00% principal-loss proxy.", "t2.grade_c")])])
+                                   "Grade C has a 40.00% principal-loss proxy.", "t2.grade_c")])], default=auto)
         wired = services(self, connection=FakeConnection(), model=model)
         code, _ = self.run_cli(["ask", "Which grade loses most?", *ARGS, "--output-dir", str(folder)], wired)
         self.assertEqual(code, 0)
@@ -194,7 +254,7 @@ class WorkflowTests(unittest.TestCase):
         model = ScriptedModel([done(), grounded, done(), {"content": "{"}, {"content": "{"}, done(), grounded])
         wired = services(self, connection=FakeConnection(), model=model,
                          lines=["", "/tools", "First question?", "Broken question?", "Third question?", "/quit"])
-        code, _ = self.run_cli(["chat", *ARGS, "--output-dir", str(folder)], wired)
+        code, _ = self.run_cli(["chat", *ARGS, "--no-critic", "--output-dir", str(folder)], wired)
         self.assertEqual(code, 0)
         printed = "\n".join(wired.printed)
         self.assertIn("Loan analyst ready", printed)
@@ -205,7 +265,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_render_requires_recorded_and_grounded_review_edits(self):
         folder = temporary_directory(self, "render-test-")
-        wired = services(self, connection=FakeConnection(), model=ScriptedModel([done(), grounded]))
+        wired = services(self, connection=FakeConnection(), model=ScriptedModel([], default=auto))
         self.assertEqual(self.run_cli(["report", *ARGS, "--output-dir", str(folder)], wired)[0], 0)
         analysis = self.read(folder, "ollama_analysis.json")
         analysis["answer"]["answer"][0]["text"] = "Edited: higher cutoffs retain fewer loans."
@@ -241,7 +301,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(json.loads(wired.printed[0])["result"]["candidate_cutoff"], 600)
         config.write_text('[model]\nmodel = "qwen3:8b"\nnum_ctx = 8192\nkeep_alive = "10m"\nmax_tool_rounds = 2\n',
                           encoding="utf-8")
-        wired = services(self, model=ScriptedModel([done(), grounded]))
+        wired = services(self, model=ScriptedModel([done(), grounded], default=auto))
         self.run_cli(["--config", str(config), "ask", "Question?", "--snapshot", str(self.saved_snapshot(wired)),
                       "--max-tool-calls", "3", "--output-dir", str(folder)], wired)
         self.assertEqual((self.model_config.model, self.model_config.num_ctx, self.model_config.keep_alive,
@@ -258,7 +318,7 @@ class WorkflowTests(unittest.TestCase):
     def test_tool_commands_print_machine_readable_json(self):
         wired = services(self)
         self.assertEqual(self.run_cli(["tools"], wired)[0], 0)
-        self.assertEqual(len(json.loads(wired.printed[0])["tools"]), 5)
+        self.assertEqual(len(json.loads(wired.printed[0])["tools"]), 8)
         wired = services(self)
         code, _ = self.run_cli(["call", "compare_score_cutoffs", '{"sql": "SELECT 1"}', "--snapshot",
                                 str(self.saved_snapshot(wired))], wired)

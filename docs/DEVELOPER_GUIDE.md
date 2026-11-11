@@ -23,7 +23,7 @@ Open [`loan_analyst/workflow.py`](../loan_analyst/workflow.py) and read
 3. run the standard analyses          (REPORT_CALLS, through the tool registry)
 4. freeze the evidence                (results + facts + content hashes)
 5. ask the analyst for commentary     (optional; --no-ai skips this)
-6. render and write four files        (report.md + three JSON files)
+6. render and write five files        (report.md, three JSON files, trace.jsonl)
 ```
 
 Each step is a comment in that function, and each step uses one clear piece of
@@ -33,10 +33,10 @@ the package:
 | --- | --- | --- |
 | 1 | `workflow.run_report` | `OllamaClient.preflight()` checks the installed local model. |
 | 2 | `workflow.obtain_snapshot` -> `snapshot.read_snapshot` | Runs one grouped SELECT per table inside one read-only transaction, then saves the result. |
-| 3 | `calculations.build_registry` + `workflow.run_calls` | Runs the seven standard tool calls. An absent optional column is skipped. |
+| 3 | `calculations.build_registry` + `workflow.run_calls` | Runs the standard tool calls in `REPORT_CALLS`. An absent optional column is skipped. |
 | 4 | `workflow.build_report_evidence` | Copies settings, query text, results, facts and hashes into the evidence dict. Model calls are added later. |
-| 5 | `analyst.Analyst.run` | The model may call tools, then writes a JSON answer; Python validates every statement. |
-| 6 | `report.render_report` + `support.write_files` | Builds Markdown and stages all four files before replacing the old ones. |
+| 5 | `analyst.Analyst.run_report` | The model plans tool calls, writes each topic in `REPORT_TOPICS` separately, has the statements reviewed, and an editor step assembles the answer. Every reply is journaled by `runtime.Run`. |
+| 6 | `report.render_report` + `support.write_files` | Builds Markdown and stages all five files before replacing the old ones. |
 
 ## Read these files in this order
 
@@ -47,8 +47,9 @@ the package:
 | 3 | `loan_analyst/snapshot.py` | `Cube.bands` (cohort + score bands) and `Snapshot` (the saved read). Skim `build_query`; the SQL is the hardest part. |
 | 4 | `loan_analyst/calculations.py` | One section at a time: shared rate rules, overview, cutoffs, segments, rejected applications. Each analysis has an `analyze_*` and an `*_facts`; the tool schemas and handlers are grouped at the end. |
 | 5 | `loan_analyst/report.py` | The tables and headings a reader sees. Each report section is a short function. |
-| 6 | `loan_analyst/analyst.py` | `Ledger`, `check_statement`, `validate_answer`, then `Analyst.run`. |
-| 7 | `tests/test_workflow.py` | Complete workflows with a fake connection and a scripted model. |
+| 6 | `loan_analyst/analyst.py` | `Ledger`, `check_statement`, `validate_answer`, then `Analyst.run` (one question) and `Analyst.run_report` (topics). |
+| 7 | `loan_analyst/runtime.py` | `Run.chat`: replay from the journal, one retry, the call budget and the trace. Short, and independent of loans. |
+| 8 | `tests/test_workflow.py` | Complete workflows with a fake connection and a scripted model. |
 
 You do not need to understand the SQL builder before changing a report heading,
 and you do not need to understand evidence validation before changing a number.
@@ -84,26 +85,51 @@ Two rules matter more than any formula:
 
 ## Follow one model answer
 
-1. `calculations.build_registry()` collects the five tools from the bottom of
+The model is never asked to do everything at once. `analyst.py` gives it one
+small role at a time, and each role is one method on `Analyst`.
+
+1. `calculations.build_registry()` collects the tools from the bottom of
    `calculations.py`. Each tool is a name, a description, a JSON schema and a
    handler.
-2. `Analyst.investigate` sends the model a short list of fact sentences and the
-   tool definitions. The model replies with a tool name and JSON arguments, or
-   with `DONE`.
+2. **Planner** (`Analyst.plan`). The model sees a short list of fact sentences
+   and decides which tools to run. In `native` tool mode (`investigate`) it
+   replies with tool calls or `DONE`. In `schema` tool mode (`plan_with_schema`)
+   it replies with a JSON list of calls whose shape is fixed by
+   `ToolRegistry.action_schema`; an empty list means done.
 3. `ToolRegistry.call` looks up the name, validates the arguments against the
    schema, runs the handler over the in-memory `Snapshot`, and returns a
-   `ToolOutput`.
+   `ToolOutput`. This is the safety boundary in both tool modes.
 4. `Ledger.record` saves the result and gives every fact an ID such as
    `t1.accepted_600`. Repeating the same call reuses the first ID.
-5. `Analyst.compose` asks for a JSON answer whose items cite those IDs.
-   `validate_answer` checks the structure, the IDs and every quoted number.
-   There is at most one repair attempt; invalid statements are withheld.
-6. `report.render_report` prints the validated statements with numbered
+5. **Writer** (`Analyst.write`). The model writes JSON statements that cite fact
+   IDs. `validate_answer` checks the structure, the IDs and every quoted number.
+   For a question there is one writer. For a report there is one writer per
+   `Topic` in `workflow.REPORT_TOPICS`, and each sees only its own facts
+   (`Analyst.topic_fact_ids`).
+6. **Critic** (`Analyst.critique`, when enabled). The model sees each statement
+   beside only the facts it cites and returns `supported`, `not_supported` or
+   `overreach`. Statements that merely repeat whole fact sentences are skipped
+   (`is_verbatim`). A missing verdict counts against the statement.
+7. Problems from steps 5 and 6 go back to the writer for **one** repair. What
+   still fails is withheld and listed in the artifact.
+8. **Editor** (`Analyst.edit`, reports only). The model selects validated
+   statements by ID and writes only the headline and next steps. Selecting by ID
+   cannot introduce a new number.
+9. `report.render_report` prints the validated statements with numbered
    citations, and lists the original fact sentences under "Evidence cited".
 
-The checks prove that a number appears in a cited fact. They do **not** prove
-that the model's interpretation is right. That is why model text is labelled
-for review.
+Python's checks prove that a number appears in a cited fact. The critic is the
+same kind of model as the writer. Neither proves that an interpretation is
+right. That is why model text is labelled for review.
+
+### What happens when a run stops halfway
+
+Every model call goes through `runtime.Run.chat`. After each reply it appends
+one line to `outputs/runs/<run id>/journal.jsonl`. `report --resume` repeats the
+same steps from the top: tool calls are simply computed again, and a model call
+whose inputs match the next journal line is answered from the file. The first
+call that differs ends the replay. Nothing in the steps needs to know it is
+being resumed, which is why there is no "resume" code in `analyst.py`.
 
 ## The objects worth knowing
 
@@ -118,6 +144,9 @@ for review.
 | `Cube` | `snapshot.py` | One source's grouped rows. `bands()` splits them by cohort status and score band. |
 | `ToolOutput` | `tools.py` | One calculation: a title, a structured `result`, citable `facts` and optional `highlights`. |
 | `Ledger` | `analyst.py` | Facts by ID plus the tool calls that produced them. |
+| `Topic` | `analyst.py` (listed in `workflow.REPORT_TOPICS`) | One part of the report: its goal, the standard calls it covers, the tools the planner may add for it and its definitions. |
+| `Run` | `runtime.py` | One run's access to the model: journal replay, one retry of a transient failure, the model-call budget and tracing. |
+| `Journal`, `Tracer` | `runtime.py` | The saved model replies of an unfinished run, and the timing spans written to `trace.jsonl`. |
 | Analysis artifact | `analyst.py` | The dict saved as `ollama_analysis.json`: requests, tool calls, validated answer, withheld statements, model digest and usage. |
 
 Most data between these layers is a plain dictionary or list. When you need a
@@ -130,7 +159,8 @@ result's exact fields, look at the `analyze_*` function that returns it.
 | `report.md` | The human report: calculated tables, model commentary, evidence list, definitions. |
 | `aggregates.json` | Settings, snapshot provenance, every standard result and fact, run ID and source hash. |
 | `snapshot.json` | The grouped rows and SQL, reusable with `--snapshot <file>`. |
-| `ollama_analysis.json` | Exact model requests, tool definitions/calls, the validated answer, withheld statements and usage (or a disabled status). |
+| `ollama_analysis.json` | Exact model requests, tool definitions/calls, drafted statements, critic verdicts, the validated answer, withheld statements and usage (or a disabled status). |
+| `trace.jsonl` | One timing span per step with token counts. Metadata only; print it with `python -m loan_analyst trace DIR`. |
 
 `aggregates.json` and `ollama_analysis.json` share one run ID and source hash.
 `render DIR` rebuilds `report.md` from them, so you can review wording without
@@ -148,11 +178,24 @@ touching MySQL or the model.
 | Evidence or wording checks | `check_statement` / `validate_answer` in `analyst.py` | `tests.test_answer_checks`, `tests.test_analyst` |
 | SQL or snapshot structure | `snapshot.py`; connection handling in `database.py` | `tests.test_snapshot` |
 | A new tool | add the handler, schema and `Tool(...)` at the bottom of `calculations.py` | `tests.test_tools` |
+| What a report topic covers | `REPORT_TOPICS` in `workflow.py` | `tests.test_analyst` |
+| How a role works (planner, writer, critic, editor) | the matching method on `Analyst` in `analyst.py` | `tests.test_analyst` |
+| Resume, retry, budget or trace | `runtime.py` | `tests.test_runtime` |
+| An evaluation case or metric | `evals/cases.toml`; scoring in `evals.py` | `tests.test_evals`; live `eval` run separately |
+| What other programs can call | `mcp_server.py` (it serves the same registry) | `tests.test_mcp_server` |
 
 For a new tool, follow an existing one exactly: write the calculation, turn every
-number the model may quote into a fact sentence, register a `Tool`, and (if it
-belongs in every report) add a call to `workflow.REPORT_CALLS` and a renderer to
-`report.SECTIONS`.
+number the model may quote into a fact sentence (including any difference or
+ratio, because the model may not calculate), register a `Tool`, and (if it
+belongs in every report) add a call to `workflow.REPORT_CALLS`, list it in the
+`Topic` that should write about it, and add a renderer to `report.SECTIONS`.
+
+After changing a prompt, a role or the default model, run the evaluation suite
+against a saved snapshot and compare with an earlier result:
+
+```powershell
+.\.venv\Scripts\python.exe -m loan_analyst eval --snapshot latest --compare-with outputs/evals/<earlier run>/results.json
+```
 
 ## Run it without services
 
@@ -169,8 +212,11 @@ From the repository root in PowerShell:
 ```
 
 `tests/fixtures.py` holds the reusable helpers: `FakeConnection` records queries
-and transaction calls, `ScriptedModel` replays queued replies, and `services(...)`
-wires both into `Services` and captures terminal output. Tests create temporary
+and transaction calls, `ScriptedModel` replays queued replies (and can answer
+everything after them with `auto`, a valid reply built from the request's
+schema), and `services(...)` wires both into `Services` and captures terminal
+output. `planned(...)`, `verdicts(...)` and `broken()` script a plan, a critic
+review and an invalid reply. Tests create temporary
 folders under `outputs/` and remove them afterwards.
 
 `call`, `snapshot` and `report --no-ai` can read MySQL; use `--snapshot` when you
@@ -203,7 +249,10 @@ The current layout keeps one subject per file:
 * calculations and their facts live together in `calculations.py`;
 * all human-readable output lives in `report.py`;
 * everything about the model lives in `analyst.py` + `prompts.py` + `ollama.py`;
-* the workflow is a numbered recipe in `workflow.py`.
+* run plumbing that knows nothing about loans (journal, trace, budget) lives in
+  `runtime.py`;
+* the workflow is a numbered recipe in `workflow.py`;
+* `evals.py` and `mcp_server.py` are separate entry points over the same tools.
 
 The files are longer, but each is a straight read from top to bottom. When a
 file gets too long to scan, use the section banners (`# ====`) and read only the

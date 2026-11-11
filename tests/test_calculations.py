@@ -4,7 +4,7 @@ import json
 import unittest
 
 from loan_analyst import calculations, report
-from loan_analyst.tools import ToolUnavailable
+from loan_analyst.tools import ToolContext, ToolUnavailable
 from tests.fixtures import cube_rows, make_snapshot, scenario
 
 
@@ -180,6 +180,108 @@ class SegmentTests(unittest.TestCase):
         with self.assertRaises(ToolUnavailable):
             calculations.analyze_segments(snapshot, scenario(), "grade")
         self.assertTrue(calculations.analyze_segments(snapshot, scenario(), "term")["segments"])
+
+
+class PortfolioRiskTests(unittest.TestCase):
+    def setUp(self):
+        self.snapshot = make_snapshot()
+
+    def test_vintages_compare_only_seasoned_years(self):
+        result = calculations.analyze_vintages(self.snapshot, scenario())
+        self.assertEqual([(item["vintage"], item["seasoned"]) for item in result["vintages"]],
+                         [("2014", False), ("2015", True), ("2016", False)])
+        self.assertIsNone(result["seasoned_change"])  # one seasoned vintage is not a comparison
+        facts = calculations.vintage_facts(result)
+        self.assertIn("Fewer than two vintages are seasoned at the 80.00% threshold", facts["seasoned_range"])
+        self.assertNotIn("seasoned_change", facts)
+        self.assertIn("2 of 3 vintages are below the 80.00% seasoning threshold: 2014, 2016.", facts["unseasoned"])
+        self.assertIn("principal-loss proxy N/A; not seasoned", facts["vintage_2014"])  # open loans are not 0%
+        self.assertEqual(calculations.vintage_highlights(facts), ("scope", "seasoned_range", "unseasoned"))
+
+    def test_quarterly_vintages_report_the_change_in_percentage_points(self):
+        result = calculations.analyze_vintages(self.snapshot, scenario(), "quarter", min_terminal_share=.5)
+        self.assertEqual(result["comparable"], ["2015-Q1", "2015-Q2"])
+        self.assertAlmostEqual(result["seasoned_change"]["change_pp"], -40)
+        facts = calculations.vintage_facts(result)
+        self.assertIn("highest principal-loss proxy is 2015-Q1 at 40.00% and the lowest is 2015-Q2 at 0.00%",
+                      facts["seasoned_range"])
+        self.assertIn("is lower by 40.00 percentage points (40.00% versus 0.00%)", facts["seasoned_change"])
+        self.assertIn("Issue quarter 2015-Q1: 3 loans; terminal share 66.67%", facts["vintage_2015_q1"])
+        table = report.vintage_table(result)
+        self.assertIn("| 2014-Q1 | 5 | 0.00% | no | N/A | N/A |", table)
+        with self.assertRaises(ValueError):
+            calculations.analyze_vintages(self.snapshot, scenario(), "decade")
+
+    def test_concentration_compares_loss_share_with_principal_share(self):
+        result = calculations.analyze_concentration(self.snapshot, scenario(), "score_band")
+        self.assertEqual((result["complete_loans"], result["principal"], result["loss_amount"]), (4, 400, 80))
+        segments = {item["segment"]: item for item in result["segments"]}
+        self.assertEqual((segments["600-699"]["principal_share"], segments["600-699"]["loss_share"],
+                          segments["600-699"]["loss_to_principal_ratio"]), (.5, 1, 2))
+        self.assertEqual(segments["700+"]["loss_to_principal_ratio"], 0)
+        self.assertIsNone(segments["below 600"]["loss_to_principal_ratio"])  # no complete loans: N/A, not zero
+        self.assertEqual([item["segment"] for item in result["top"]], ["600-699"])
+        facts = calculations.concentration_facts(result)
+        self.assertIn("50.00% of funded principal and 100.00% of unrecovered principal", facts["score_band_600_699"])
+        self.assertIn("its loss share is 2.00 times its principal share", facts["score_band_600_699"])
+        self.assertIn("ratio of loss share to principal share is N/A", facts["score_band_below_600"])
+        self.assertIn("largest contributor to unrecovered principal is score band 600-699 with 100.00%", facts["top"])
+        self.assertIn("600-699 carries the most loss (2.00 times its principal share) and 700+ the least (0.00",
+                      facts["overweight"])
+        self.assertIn("| 600-699 | 2 | 50.00% | 100.00% | 2.00 |", report.concentration_table(result))
+
+    def test_concentration_without_losses_or_columns_is_unavailable(self):
+        no_loss = calculations.analyze_concentration(self.snapshot, scenario(), "grade", min_score=700)
+        self.assertIsNone(no_loss["segments"][0]["loss_share"])
+        facts = calculations.concentration_facts(no_loss)
+        self.assertIn("loss shares are unavailable", facts["top"])
+        self.assertNotIn("overweight", facts)
+        snapshot = make_snapshot(dimensions=("term",))
+        for analyze in (calculations.analyze_concentration, calculations.analyze_mix):
+            with self.subTest(analyze=analyze), self.assertRaises(ToolUnavailable):
+                analyze(snapshot, scenario(), "grade")
+
+    def test_mix_follows_shares_and_average_score_across_issue_years(self):
+        result = calculations.analyze_mix(self.snapshot, scenario(end_month="2015-12"), "score_band")
+        self.assertEqual(result["segments"], ["below 600", "600-699", "700+"])
+        self.assertEqual([(year["year"], year["loans"]) for year in result["years"]], [("2014", 5), ("2015", 5)])
+        self.assertAlmostEqual(result["years"][1]["average_score"], 668.8)
+        self.assertAlmostEqual(result["average_score_change"], 88.8)
+        facts = calculations.mix_facts(result)
+        self.assertIn("score band mix: below 600 0.00%, 600-699 60.00%, 700+ 40.00%.", facts["year_2015"])
+        self.assertIn("600-699 was 0.00% of issued loans in 2014 and 60.00% in 2015, a change of +60.00 percentage",
+                      facts["change_600_699"])
+        self.assertIn("largest change in mix is score band below 600: 100.00% to 0.00%", facts["largest_shift"])
+        self.assertIn("was 580.0 in 2014 and 668.8 in 2015, a change of +88.8 points", facts["average_score"])
+        self.assertIn("| 2015 | 5 | 668.8 | 0.00% | 60.00% | 40.00% |", report.mix_table(result))
+
+    def test_mix_without_scores_or_a_second_year_stays_unavailable(self):
+        unscored = calculations.mix_facts(calculations.analyze_mix(self.snapshot, scenario(), "term"))
+        self.assertNotIn("average_score", unscored)  # 2016 has no valid score: no change is invented
+        self.assertIn("average score N/A", unscored["year_2016"])
+        one_year = calculations.analyze_mix(self.snapshot, scenario(start_month="2015-01", end_month="2015-12"),
+                                            "score_band")
+        self.assertEqual(one_year["changes"], [])
+        self.assertIn("fewer than two issue years", calculations.mix_facts(one_year)["largest_shift"])
+        with self.assertRaises(ValueError):
+            calculations.analyze_mix(self.snapshot, scenario(), "issue_year")
+
+    def test_new_tools_run_through_the_registry_with_json_safe_results(self):
+        registry = calculations.build_registry()
+        context = ToolContext(self.snapshot, scenario())
+        for name, arguments in (("vintage_trend", {"period": "quarter", "min_terminal_share": .5}),
+                                ("loss_concentration", {"dimension": "term"}),
+                                ("mix_shift", {"dimension": "grade"})):
+            with self.subTest(tool=name):
+                envelope = registry.call(name, arguments, context)
+                self.assertTrue(envelope["ok"], envelope)
+                output = envelope["output"]
+                self.assertTrue(set(output.highlights) <= set(output.facts))
+                json.dumps(output.result, allow_nan=False)
+        self.assertEqual(registry.call("vintage_trend", {"min_terminal_share": 80}, context)["error"]["code"],
+                         "invalid_arguments")
+        self.assertEqual(registry.call("mix_shift", {"dimension": "issue_year"}, context)["error"]["code"],
+                         "invalid_arguments")
 
 
 class RejectedTests(unittest.TestCase):

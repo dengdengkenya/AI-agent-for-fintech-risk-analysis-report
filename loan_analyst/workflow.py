@@ -15,17 +15,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import shutil
 import sys
 from time import perf_counter
 from uuid import uuid4
 
 from . import PROJECT_ROOT, prompts
-from .analyst import (ASK_SECTIONS, REPORT_SECTIONS, AnalysisError, Analyst, ChatSession,
-                      Ledger, validate_answer)
+from .analyst import (ASK_SECTIONS, AnalysisError, Analyst, ChatSession, Ledger, Topic,
+                      validate_answer)
 from .calculations import DEFINITIONS, build_registry
 from .database import ConfigurationError, password_connection_factory
 from .ollama import ModelError, OllamaClient
 from .report import DEFAULT_SECTIONS, answer_markdown, answer_text, render_report
+from .runtime import (BudgetExceeded, Journal, ResumeError, Run, Tracer, format_trace,
+                      identity_differences, read_trace)
 from .settings import DatabaseConfig, ModelConfig, Scenario, SettingsError
 from .snapshot import (SOURCES, SchemaError, build_query, load_snapshot, read_snapshot,
                        save_snapshot)
@@ -43,6 +46,50 @@ REPORT_CALLS = (
     ("segment_performance", {"dimension": "grade"}),
     ("segment_performance", {"dimension": "term"}),
     ("rejected_applications", {"by": "score_era"}),
+    ("vintage_trend", {}),
+    ("loss_concentration", {"dimension": "score_band"}),
+    ("loss_concentration", {"dimension": "grade"}),
+    ("mix_shift", {"dimension": "score_band"}),
+)
+
+
+# How the analyst divides the report. Each topic is written by its own model call
+# that sees only that topic's facts, which keeps a small model focused. A topic
+# whose standard calls are all unavailable in this snapshot is skipped.
+REPORT_TOPICS = (
+    Topic("tradeoff",
+          "The main tradeoff between retained loan volume and historical losses across the tested score "
+          "cutoffs, and which score bands drive it.",
+          calls=(("compare_score_cutoffs", {}), ("segment_performance", {"dimension": "score_band"}),
+                 ("loss_concentration", {"dimension": "score_band"})),
+          tools=("compare_score_cutoffs", "sweep_loss_ceilings", "segment_performance", "loss_concentration"),
+          definitions=("retained", "loss_proxy", "candidate_rule", "concentration"),
+          dimensions=("score_band",)),
+    Topic("vintages",
+          "How performance and the origination mix differ by issue year, and which vintages are seasoned "
+          "enough to compare.",
+          calls=(("vintage_trend", {}), ("segment_performance", {"dimension": "issue_year"}),
+                 ("mix_shift", {"dimension": "score_band"})),
+          tools=("vintage_trend", "mix_shift", "segment_performance"),
+          definitions=("seasoning", "mix", "loss_proxy"),
+          dimensions=("issue_year",)),
+    Topic("segments",
+          "How historical losses differ by loan grade and term, and where losses are concentrated.",
+          calls=(("segment_performance", {"dimension": "grade"}), ("segment_performance", {"dimension": "term"}),
+                 ("loss_concentration", {"dimension": "grade"})),
+          tools=("segment_performance", "loss_concentration"),
+          definitions=("loss_proxy", "concentration"),
+          dimensions=("grade", "term")),
+    Topic("rejected",
+          "What the rejected applications show and why they cannot be read as lending opportunity.",
+          calls=(("rejected_applications", {"by": "score_era"}),),
+          tools=("rejected_applications",),
+          definitions=("rejected_scores",)),
+    Topic("data_quality",
+          "Which data limitations and exclusions matter most when reading this report.",
+          calls=(("describe_data", {}),),
+          tools=("describe_data",),
+          definitions=("source_limits", "next_checks")),
 )
 
 
@@ -66,6 +113,7 @@ class Services:
     connection_factory: Callable = password_connection_factory
     model_factory: Callable = OllamaClient
     snapshot_dir: Path = PROJECT_ROOT / "outputs" / "snapshots"
+    runs_dir: Path = PROJECT_ROOT / "outputs" / "runs"  # journals of unfinished runs
     default_config: Path | None = PROJECT_ROOT / "loan_analyst.toml"
     log: Callable = status
     out: Callable = print
@@ -82,6 +130,7 @@ class RunOptions:
     model: ModelConfig | None = None  # None disables the model (report --no-ai).
     output_dir: Path = PROJECT_ROOT / "outputs" / "framework_report"
     snapshot: str | None = None  # a saved snapshot path, or "latest"
+    resume: str | None = None  # an interrupted report run ID, or "latest"
     sections: tuple = DEFAULT_SECTIONS
 
 
@@ -147,15 +196,21 @@ def progress(log):
             log(f"    {details['call_id']} {details['name']}({_short(details['arguments'])}){repeat}")
         elif event == "tool_error":
             log(f"    rejected {details['name']}: {details['error']['code']}")
+        elif event == "topic":
+            log(f"  Topic: {details['name']}")
         elif event == "composing":
-            log(f"  Writing the evidence-checked answer (attempt {details['attempt']})...")
+            stage = details.get("stage", "compose")
+            what = "Assembling the report answer" if stage == "edit" else "Writing evidence-checked statements"
+            log(f"  {what} (attempt {details['attempt']})...")
+        elif event == "reviewed":
+            log(f"    Critic reviewed {details['reviewed']} statement(s), flagged {details['flagged']}.")
         elif event == "answered":
             log(f"  {details['statements']} statement(s) validated, {details['withheld']} withheld.")
 
     return on_event
 
 
-def build_report_evidence(options, snapshot, ledger, services):
+def build_report_evidence(options, snapshot, ledger, services, run_id=None):
     """Freeze the calculated results before the model adds its own tool calls.
 
     The source hash links the report and model answer to these exact inputs.
@@ -190,7 +245,7 @@ def build_report_evidence(options, snapshot, ledger, services):
     return {
         "format": REPORT_FORMAT,
         "mode": "historical_mysql",
-        "run_id": str(uuid4()),
+        "run_id": run_id or str(uuid4()),  # a resumed run keeps its original ID
         "source_evidence_sha256": sha256_json(source),
         "generated_at_utc": services.clock(),
         "settings": settings,
@@ -219,40 +274,73 @@ def run_report(options: RunOptions, services: Services):
     """Read data, calculate facts, validate model commentary, then write the report."""
     started = perf_counter()
 
+    tracer = Tracer(clock=services.clock)
+
+    # 0. --resume continues an interrupted run from its journal and its own snapshot.
+    journal = None
+    snapshot_reference = options.snapshot
+    if options.resume:
+        journal, snapshot_reference = find_interrupted_run(options, services)
+
     # 1. Check the local model before an expensive MySQL scan.
     client = None
     if options.model is not None:
-        services.log(f"Checking local Ollama model {options.model.model}...")
-        client = services.model_factory(options.model)
-        client.preflight()
+        client = check_model(options.model, services)
 
     # 2. Read MySQL once, or load the explicitly requested saved snapshot.
-    snapshot = obtain_snapshot(options.database, options.snapshot, services)
+    with tracer.span("snapshot"):
+        snapshot = obtain_snapshot(options.database, snapshot_reference, services)
 
     # 3. Run the standard analyses over the in-memory snapshot.
-    registry = build_registry()
-    context = ToolContext(snapshot, options.scenario)
-    ledger = Ledger(DEFINITIONS)
-    run_calls(registry, context, ledger, REPORT_CALLS)
+    with tracer.span("standard analyses"):
+        registry = build_registry()
+        context = ToolContext(snapshot, options.scenario)
+        ledger = Ledger(DEFINITIONS)
+        run_calls(registry, context, ledger, REPORT_CALLS)
     services.log(f"Computed {len(ledger.calls)} analyses from the snapshot.")
 
     # 4. Freeze the calculated inputs before the model can add tool calls.
-    evidence = build_report_evidence(options, snapshot, ledger, services)
+    evidence = build_report_evidence(options, snapshot, ledger, services,
+                                     run_id=journal.run_id if journal else None)
 
     # 5. Optionally let the analyst investigate and write checked commentary.
+    #    Every model reply is journaled, so a failure here can be resumed.
     if client is None:
         analysis = {"status": "disabled", "reason": "Explicit --no-ai option"}
     else:
+        identity = run_identity(options, snapshot, client, registry)
+        if journal is None:
+            journal = Journal.create(services.runs_dir, evidence["run_id"], "report", identity,
+                                     snapshot_id=snapshot.snapshot_id)
+        else:
+            different = identity_differences(journal.header["identity"], identity)
+            if different:
+                raise ResumeError(f"Run {journal.run_id} cannot be resumed: these inputs changed since it "
+                                  f"started: {', '.join(different)}. Rerun without --resume")
+            services.log(f"Resuming run {journal.run_id}; saved model replies are reused when the "
+                         "request is identical.")
+
         services.log("Analyst reviewing the results; it may run further tools over the snapshot...")
-        analyst = Analyst(
-            client, registry, context, ledger,
-            max_rounds=options.model.max_tool_rounds,
-            max_calls=options.model.max_tool_calls,
-            on_event=progress(services.log),
-        )
-        analysis = analyst.run(prompts.REPORT_GOAL, sections=REPORT_SECTIONS,
-                               preload=ledger.highlights("report"))
+        model_run = Run(client, journal=journal, tracer=tracer,
+                        max_model_calls=options.model.max_model_calls)
+        analyst = build_analyst(client, registry, context, ledger, options.model, services, model_run)
+        try:
+            with tracer.span("analyst", **{"gen_ai.operation.name": "invoke_agent"}):
+                analysis = analyst.run_report(prompts.REPORT_GOAL, REPORT_TOPICS,
+                                              preload=ledger.highlights("report"))
+        except AnalysisError:
+            # The model answered but its text failed validation. Replaying the same
+            # replies would fail the same way, so there is nothing worth resuming.
+            shutil.rmtree(journal.path.parent, ignore_errors=True)
+            raise
+        except BaseException:
+            services.log(f"Run {journal.run_id} stopped; its finished model replies are saved. Continue "
+                         f"without repeating them: python -m loan_analyst report --resume {journal.run_id}")
+            raise
         analysis["tool_results"] = [call for call in ledger.calls if call["origin"] == "model"]
+        if model_run.replayed:
+            analysis["replayed_model_calls"] = model_run.replayed
+            services.log(f"  Reused {model_run.replayed} saved model reply(ies) from the interrupted run.")
 
     analysis.update(run_id=evidence["run_id"],
                     source_evidence_sha256=evidence["source_evidence_sha256"])
@@ -260,28 +348,102 @@ def run_report(options: RunOptions, services: Services):
         key: analysis[key] for key in ("status", "run_id", "source_evidence_sha256")}
     evidence["elapsed_seconds"] = perf_counter() - started
 
-    # 6. Render and serialize everything, then replace the four output files.
+    # 6. Render and serialize everything, then replace the five output files.
     #    A failure before this point leaves earlier report files untouched.
     write_files(options.output_dir, {
         "report.md": render_report(report_data(evidence, analysis), options.sections),
         "aggregates.json": json.dumps(evidence, indent=2, allow_nan=False),
         "snapshot.json": json.dumps(snapshot.to_payload(), separators=(",", ":"), allow_nan=False),
         "ollama_analysis.json": json.dumps(analysis, indent=2, ensure_ascii=False, allow_nan=False),
+        "trace.jsonl": tracer.to_jsonl(evidence["run_id"]),
     })
+
+    # The journal only exists to resume an unfinished run.
+    if journal is not None:
+        shutil.rmtree(journal.path.parent, ignore_errors=True)
 
     folder = display_path(options.output_dir)
     services.out(f"Report: {folder}/report.md")
     services.out(f"Evidence: {folder}/aggregates.json, {folder}/snapshot.json, "
-                 f"{folder}/ollama_analysis.json")
-    services.log(f"Completed in {perf_counter() - started:.1f}s. Reruns replace these four files.")
+                 f"{folder}/ollama_analysis.json, {folder}/trace.jsonl")
+    services.log(f"Completed in {perf_counter() - started:.1f}s. Reruns replace these five files.")
     return 0
+
+
+def find_interrupted_run(options, services):
+    """Locate the journal to resume and the saved snapshot that run used.
+
+    Resuming is an explicit request to reuse that run's snapshot; MySQL is not
+    queried. The snapshot file is still verified against its content hash.
+    """
+    if options.model is None:
+        raise SettingsError("--resume continues the analyst's work; it cannot be combined with --no-ai")
+    if options.snapshot is not None:
+        raise SettingsError("--resume reuses the interrupted run's own snapshot; omit --snapshot")
+
+    journal = Journal.find(services.runs_dir, options.resume)
+    if journal.header.get("kind") != "report" or not journal.header.get("snapshot_id"):
+        raise ResumeError("The saved run is not a report run; start again without --resume")
+    snapshot_path = services.snapshot_dir / f"snapshot-{journal.header['snapshot_id']}.json"
+    return journal, str(snapshot_path)
+
+
+def run_identity(options, snapshot, client, registry):
+    """Everything that must be unchanged for saved model replies to remain valid."""
+    metadata = client.metadata or {}
+    return {
+        "snapshot_sha256": snapshot.content_sha256,
+        "database": options.database.sources(),
+        "scenario": options.scenario.to_dict(),
+        "model": metadata.get("model"),
+        "model_digest": metadata.get("model_digest"),
+        "prompt_version": prompts.VERSION,
+        "tool_definitions_sha256": sha256_json(registry.definitions()),
+        "max_tool_rounds": options.model.max_tool_rounds,
+        "max_tool_calls": options.model.max_tool_calls,
+        "tool_mode": options.model.tool_mode,
+        "critic": options.model.critic,
+    }
+
+
+def run_trace(directory, services):
+    """Print the step timeline saved with a report."""
+    try:
+        trace_id, spans = read_trace((directory / "trace.jsonl").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise SettingsError(f"{display_path(directory)} does not contain a readable trace.jsonl") from None
+    services.out(format_trace(trace_id, spans))
+    return 0
+
+
+def check_model(model, services):
+    """Create the model client and verify the installed local model before any slow work."""
+    services.log(f"Checking local Ollama model {model.model}...")
+    client = services.model_factory(model)
+    if model.tool_mode == "native":
+        client.preflight()
+    else:
+        # Schema mode asks for plain JSON, so the model needs no tool-calling support.
+        client.preflight(require_tools=False)
+    return client
+
+
+def build_analyst(client, registry, context, ledger, model, services, model_run):
+    """One place that turns ModelConfig into an Analyst, for every command."""
+    return Analyst(
+        client, registry, context, ledger,
+        max_rounds=model.max_tool_rounds,
+        max_calls=model.max_tool_calls,
+        on_event=progress(services.log),
+        run=model_run,
+        tool_mode=model.tool_mode,
+        critic=model.critic,
+    )
 
 
 def prepare_session(options, services):
     """Check the model, obtain one snapshot, and prepare its analyst."""
-    services.log(f"Checking local Ollama model {options.model.model}...")
-    client = services.model_factory(options.model)
-    client.preflight()
+    client = check_model(options.model, services)
 
     snapshot = obtain_snapshot(options.database, options.snapshot, services)
 
@@ -290,12 +452,9 @@ def prepare_session(options, services):
     ledger = Ledger(DEFINITIONS)
     run_calls(registry, context, ledger, [("describe_data", {})])
 
-    analyst = Analyst(
-        client, registry, context, ledger,
-        max_rounds=options.model.max_tool_rounds,
-        max_calls=options.model.max_tool_calls,
-        on_event=progress(services.log),
-    )
+    # The model-call budget is per question, so each chat turn starts a fresh count.
+    analyst = build_analyst(client, registry, context, ledger, options.model, services,
+                            Run(client, max_model_calls=options.model.max_model_calls))
     return snapshot, ledger, analyst
 
 
@@ -339,6 +498,8 @@ CHAT_HELP = ("Ask a question in plain English. Commands: /tools lists the analys
 def run_chat(options, services):
     snapshot, ledger, analyst = prepare_session(options, services)
     session = ChatSession(analyst, preload=ledger.highlights("report"))
+    # One transcript per session, named for when the session started.
+    stamp = datetime.fromisoformat(services.clock()).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     provenance = snapshot.provenance()
     accepted_rows = provenance["sources"]["accepted"]["total_rows"]
@@ -365,7 +526,7 @@ def run_chat(options, services):
 
         try:
             result = session.ask(line)
-        except (AnalysisError, ModelError) as error:
+        except (AnalysisError, ModelError, BudgetExceeded) as error:
             services.out(f"analyst> Sorry, I could not produce a validated answer: {error}")
             continue
         except KeyboardInterrupt:
@@ -373,23 +534,28 @@ def run_chat(options, services):
             continue
 
         services.out("\n" + answer_text(result))
+        # Save after every answer, so a crash or closed terminal loses nothing.
+        save_chat(session, snapshot, options, ledger, stamp)
 
     if session.turns:
-        stamp = datetime.fromisoformat(services.clock()).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        turns = []
-        for turn in session.turns:
-            turns.append({"question": turn["question"], "analysis": turn["result"]})
-
-        markdown = "\n".join(answer_markdown(turn["question"], turn["result"])
-                             for turn in session.turns)
-        transcript = build_transcript(snapshot, options, turns, ledger)
-        write_files(options.output_dir, {
-            f"chat-{stamp}.md": markdown,
-            f"chat-{stamp}.json": json.dumps(transcript, indent=2, ensure_ascii=False,
-                                             allow_nan=False),
-        })
         services.log(f"Saved {display_path(options.output_dir)}/chat-{stamp}.md and .json")
     return 0
+
+
+def save_chat(session, snapshot, options, ledger, stamp):
+    """Write the whole session so far; each save replaces the previous one."""
+    turns = []
+    for turn in session.turns:
+        turns.append({"question": turn["question"], "analysis": turn["result"]})
+
+    markdown = "\n".join(answer_markdown(turn["question"], turn["result"])
+                         for turn in session.turns)
+    transcript = build_transcript(snapshot, options, turns, ledger)
+    write_files(options.output_dir, {
+        f"chat-{stamp}.md": markdown,
+        f"chat-{stamp}.json": json.dumps(transcript, indent=2, ensure_ascii=False,
+                                         allow_nan=False),
+    })
 
 
 def check_review(analysis):

@@ -29,10 +29,18 @@ model = "qwen3:4b-instruct-2507-q4_K_M"
 timeout = 300
 max_tool_rounds = 4
 max_tool_calls = 8
+# Safety limit on model requests for one report or one question.
+max_model_calls = 40
+# How the analyst requests tools: "native" (the model's own tool calls) or "schema"
+# (a JSON list constrained by a structured-output schema; needs no tool-calling support).
+tool_mode = "native"
+# A second model pass that reviews each statement against the facts it cites.
+# Turn it off for a faster run; Python's evidence checks always run.
+critic = true
 
 [report]
 output_dir = "outputs/framework_report"
 # Reorder or drop sections; see `python -m loan_analyst report --help` for names.
-sections = ["summary", "analyst", "at_a_glance", "cutoffs", "score_bands", "vintages", "segments",
-            "rejected", "coverage", "next_decision", "investigation", "evidence", "definitions",
-            "reproducibility"]
+sections = ["summary", "analyst", "at_a_glance", "cutoffs", "score_bands", "vintages", "vintage_trend",
+            "segments", "concentration", "mix_shift", "rejected", "coverage", "next_decision",
+            "investigation", "evidence", "definitions", "reproducibility"]

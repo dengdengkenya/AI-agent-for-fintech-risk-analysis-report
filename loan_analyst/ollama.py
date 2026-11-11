@@ -22,7 +22,26 @@ MAX_REQUEST_BYTES = 400_000
 
 
 class ModelError(RuntimeError):
-    """An actionable failure that is safe to show without raw service response contents."""
+    """An actionable failure that is safe to show without raw service response contents.
+
+    ``transient`` marks failures worth one identical retry: a timeout, a refused
+    connection or a server-side (5xx) error. Everything else needs a human.
+    """
+
+    def __init__(self, message, transient=False):
+        super().__init__(message)
+        self.transient = transient
+
+
+def _context_length(details):
+    """The model's trained context window from /api/show, when the server reports it."""
+    info = details.get("model_info")
+    if not isinstance(info, dict):
+        return None
+    for key, value in info.items():
+        if str(key).endswith(".context_length") and type(value) is int and value > 0:
+            return value
+    return None
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -74,10 +93,11 @@ def request_json(base_url, path, *, payload=None, timeout=10):
     except HTTPError as error:
         with suppress(Exception):
             error.close()  # discard the body unread: service error text is never relayed
-        raise ModelError(f"Ollama HTTP {error.code}; check the local model and server") from None
+        raise ModelError(f"Ollama HTTP {error.code}; check the local model and server",
+                         transient=error.code >= 500) from None
     except (URLError, TimeoutError, OSError):
         raise ModelError("Local Ollama is unavailable or timed out; start Ollama or increase "
-                         "--ollama-timeout") from None
+                         "--ollama-timeout", transient=True) from None
     except (ValueError, UnicodeError):
         raise ModelError("Ollama returned invalid JSON") from None
 
@@ -121,8 +141,14 @@ class OllamaClient:
                              f"Run `ollama pull {recommended}`, then use --ollama-model {recommended}. "
                              "Reuse an existing snapshot with --snapshot latest; MySQL was not queried")
 
+        context_length = _context_length(details)
+        if context_length is not None and config.num_ctx > context_length:
+            raise ModelError(f"--num-ctx {config.num_ctx} exceeds the {context_length}-token context window "
+                             f"of {config.model}; use --num-ctx {context_length} or less")
+
         version = request_json(config.url, "/api/version")
         self.metadata = {
+            "context_length": context_length,
             "model": config.model,
             "model_digest": model.get("digest"),
             "server_version": version.get("version"),

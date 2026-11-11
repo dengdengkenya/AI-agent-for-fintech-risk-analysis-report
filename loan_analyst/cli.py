@@ -11,13 +11,15 @@ import math
 import sys
 
 from .calculations import DEFINITIONS, build_registry
+from .evals import DEFAULT_SUITE, run_eval
+from .mcp_server import run_mcp
 from .report import DEFAULT_SECTIONS, check_sections
-from .settings import (DatabaseConfig, ModelConfig, Scenario, SettingsError, check_month,
+from .settings import (TOOL_MODES, DatabaseConfig, ModelConfig, Scenario, SettingsError, check_month,
                        load_config, project_path)
 from .support import display_path
 from .tools import ToolContext
 from .workflow import (RunOptions, Services, obtain_snapshot, preview_queries, run_ask,
-                       run_chat, run_render, run_report)
+                       run_chat, run_render, run_report, run_trace)
 
 DESCRIPTION = """Historical Lending Club score-cutoff analysis from MySQL, with a local tool-calling analyst.
 
@@ -27,6 +29,9 @@ common workflows:
   ask "QUESTION"              answer one question; the analyst chooses and runs tools
   chat                        interactive analyst session over one snapshot
   render DIR                  re-render a report after reviewing ollama_analysis.json
+  report --resume             continue an interrupted report without repeating model calls
+  eval --snapshot latest      score the analyst on evals/cases.toml to compare models or prompts
+  trace DIR                   show where a report's time and tokens went
 """
 
 
@@ -121,6 +126,13 @@ def _add_model_arguments(parser, defaults):
                             "(default %(default)s)")
     group.add_argument("--max-tool-calls", type=positive_int, default=values.get("max_tool_calls", 8),
                        help="Total tool calls the analyst may make (default %(default)s)")
+    group.add_argument("--tool-mode", choices=TOOL_MODES, default=values.get("tool_mode", "native"),
+                       help="How the analyst requests tools: the model's native tool calls, or a JSON list "
+                            "constrained by a schema (default %(default)s)")
+    group.add_argument("--critic", action=argparse.BooleanOptionalAction, default=values.get("critic", True),
+                       help="Have the model review each statement against its cited facts (default on)")
+    group.add_argument("--max-model-calls", type=positive_int, default=values.get("max_model_calls", 40),
+                       help="Safety limit on model requests per report or question (default %(default)s)")
 
 
 def _add_output_argument(parser, default):
@@ -150,6 +162,9 @@ def build_parser(defaults=None):
                         help="Explicitly write only the calculated MySQL report")
     report.add_argument("--print-sql", action="store_true",
                         help="Print the aggregate SQL without connecting")
+    report.add_argument("--resume", nargs="?", const="latest", metavar="RUN_ID",
+                        help="Continue an interrupted report run (default: the latest) from its saved "
+                             "snapshot and model replies; MySQL is not queried")
 
     for name, help_text, folder in (("ask", "Answer one question with the tool-calling analyst", "outputs/ask"),
                                     ("chat", "Interactive analyst session", "outputs/chat")):
@@ -167,6 +182,22 @@ def build_parser(defaults=None):
     render.add_argument("--sections", type=sections,
                         default=report_defaults.get("sections", list(DEFAULT_SECTIONS)))
 
+    evaluate = commands.add_parser("eval", help="Score the analyst on a question suite over a saved snapshot")
+    evaluate.add_argument("--suite", type=project_path, default=DEFAULT_SUITE,
+                          help="TOML suite of cases (default evals/cases.toml)")
+    evaluate.add_argument("--repeat", type=positive_int, default=1,
+                          help="Run every case this many times (default %(default)s)")
+    evaluate.add_argument("--compare-with", type=project_path, metavar="RESULTS_JSON",
+                          help="An earlier eval results.json to show changes against")
+    _add_database_arguments(evaluate, defaults)
+    _add_snapshot_argument(evaluate)
+    _add_scenario_arguments(evaluate, defaults)
+    _add_model_arguments(evaluate, defaults)
+    _add_output_argument(evaluate, "outputs/evals")
+
+    trace = commands.add_parser("trace", help="Print the step timeline (time, tokens) saved with a report")
+    trace.add_argument("directory", type=project_path, help="Report folder, e.g. outputs/framework_report")
+
     commands.add_parser("tools", help="Print the analyst's tool catalog as JSON")
     call = commands.add_parser("call", help="Run one tool and print JSON facts and results")
     call.add_argument("name", help="Tool name from the `tools` command")
@@ -175,6 +206,12 @@ def build_parser(defaults=None):
     _add_database_arguments(call, defaults)
     _add_snapshot_argument(call)
     _add_scenario_arguments(call, defaults)
+
+    mcp = commands.add_parser("mcp", help="Serve the analysis tools to a local MCP client over stdio, "
+                                          "from a saved snapshot")
+    _add_database_arguments(mcp, defaults)
+    _add_snapshot_argument(mcp)
+    _add_scenario_arguments(mcp, defaults)
 
     sql = commands.add_parser("sql", help="Print the aggregate SQL without connecting")
     _add_database_arguments(sql, defaults)
@@ -220,6 +257,9 @@ def _options(parser, args):
                 num_ctx=args.num_ctx,
                 max_tool_rounds=args.max_tool_rounds,
                 max_tool_calls=args.max_tool_calls,
+                max_model_calls=args.max_model_calls,
+                tool_mode=args.tool_mode,
+                critic=args.critic,
             )
 
         # Keep RunOptions defaults for flags that this command does not expose.
@@ -228,6 +268,8 @@ def _options(parser, args):
             extra["sections"] = check_sections(args.sections)
         if hasattr(args, "output_dir"):
             extra["output_dir"] = args.output_dir
+        if getattr(args, "resume", None):
+            extra["resume"] = args.resume
         snapshot = args.snapshot
         if snapshot not in (None, "latest"):
             snapshot = str(project_path(snapshot))
@@ -293,7 +335,7 @@ def main(argv=None, services=None):
                                 indent=2))
         return 0
 
-    options = None if args.command == "render" else _options(parser, args)
+    options = None if args.command in ("render", "trace") else _options(parser, args)
 
     try:
         if args.command == "sql" or (args.command == "report" and args.print_sql):
@@ -310,6 +352,13 @@ def main(argv=None, services=None):
             return run_chat(options, services)
         if args.command == "render":
             return run_render(args.directory, check_sections(args.sections), services)
+        if args.command == "eval":
+            return run_eval(options, services, suite=args.suite, repeat=args.repeat,
+                            baseline=args.compare_with)
+        if args.command == "mcp":
+            return run_mcp(options, services)
+        if args.command == "trace":
+            return run_trace(args.directory, services)
         if args.command == "call":
             return _call(options, args, services)
     except KeyboardInterrupt:

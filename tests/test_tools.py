@@ -23,7 +23,7 @@ class ToolTests(unittest.TestCase):
         definitions = self.registry.definitions()
         self.assertEqual({item["function"]["name"] for item in definitions}, {
             "describe_data", "compare_score_cutoffs", "sweep_loss_ceilings", "segment_performance",
-            "rejected_applications"})
+            "rejected_applications", "vintage_trend", "loss_concentration", "mix_shift"})
         for item in definitions:
             with self.subTest(tool=item["function"]["name"]):
                 self.assertEqual(item["type"], "function")

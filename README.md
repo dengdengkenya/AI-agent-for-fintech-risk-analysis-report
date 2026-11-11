@@ -11,9 +11,11 @@ synthetic mode, sample-file input or CSV fallback.
 
 A local Qwen model (via Ollama) acts as the analyst. It does more than describe a
 finished table: it chooses analysis tools, such as another cohort, a score-band
-breakdown, vintages, grades or a loss-ceiling sweep, runs them, and writes
-findings. Every statement cites the facts it relies on, and Python checks the
-statements before anything is shown.
+breakdown, vintages, loss concentration or a loss-ceiling sweep, runs them, and
+writes findings. Every statement cites the facts it relies on, Python checks the
+statements before anything is shown, and a second model pass reviews their
+interpretation. Interrupted reports can be resumed, every run leaves a trace, and
+an evaluation suite measures whether a model or prompt change is an improvement.
 
 ## Code layout
 
@@ -28,7 +30,10 @@ reading order is:
 | `loan_analyst/snapshot.py` | grouped SQL, `Cube` and `Snapshot` |
 | `loan_analyst/calculations.py` | every number in the report and the model's tools |
 | `loan_analyst/report.py` | every table and heading a reader sees |
-| `loan_analyst/analyst.py` | covered facts, answer checks and the model loop |
+| `loan_analyst/analyst.py` | citable facts, answer checks and the model's roles: planner, writer, critic, editor |
+| `loan_analyst/runtime.py` | the model-reply journal (resume), the trace and the call budget |
+| `loan_analyst/evals.py` | the evaluation suite runner and scorecard |
+| `loan_analyst/mcp_server.py` | the same tools for other local programs, over MCP stdio |
 
 The [developer guide](docs/DEVELOPER_GUIDE.md) explains the flow with a worked
 example and a glossary. You do not need MySQL or Ollama to read or test it.
@@ -90,7 +95,11 @@ All commands are `python -m loan_analyst <command>`; each has `--help`.
 | `report --snapshot latest` | Same, from the newest saved snapshot; MySQL is not queried. |
 | `ask "QUESTION"` | Answers one question; prints the answer with numbered evidence and saves a transcript. |
 | `chat` | Interactive session over one snapshot; follow-up questions keep context. `/tools`, `/help`, `/quit`. |
+| `report --resume [RUN_ID]` | Continues an interrupted report from its saved snapshot and model replies (see below). |
 | `render DIR` | Re-renders `report.md` after a human review of the wording (see below). |
+| `trace DIR` | Prints where a report's time and tokens went, step by step. |
+| `eval --snapshot latest` | Scores the analyst on `evals/cases.toml` over a saved snapshot (see below). |
+| `mcp --snapshot latest` | Serves the analysis tools to a local MCP client over stdio (see below). |
 | `tools`, `call NAME '{json}'` | Prints the tool catalog, or runs one tool and prints its facts as JSON. |
 | `sql` | Prints the exact snapshot SQL without connecting. |
 | `snapshot` | Reads MySQL and saves a snapshot without running a model. |
@@ -122,16 +131,25 @@ explicit expansion assumptions `--assume-comparable-scores`,
 2. **Report steps.** Python runs the standard analyses over the snapshot: data
    coverage, cutoff comparison, score bands, issue years, grade, term and
    rejected score eras. Each produces tables plus plain-sentence facts.
-3. **Investigation.** The model sees the key facts and may call tools for up to
+3. **Plan.** The model sees the key facts and may request tools for up to
    4 rounds and 8 calls (`--max-tool-rounds`, `--max-tool-calls`). Tools compute
-   in memory, so the model never triggers another database scan.
-4. **Evidence-checked answer.** The model chooses supporting fact IDs before
-   drafting each headline, finding, caveat and next step. Quantitative sentences
-   are requested as exact copies from one cited fact. Python checks that every number is
-   copied from the cited facts and that no statement calls a cutoff an
-   approval or rejection. Failing statements get one repair attempt; any that
-   still fail are withheld and listed. If the headline cannot be validated, the
-   run fails and earlier report files are left untouched.
+   in memory, so the model never triggers another database scan. With
+   `--tool-mode schema` the request is a JSON list constrained by a schema
+   instead of the model's native tool calls; arguments are validated either way.
+4. **Write, topic by topic.** A report is split into topics (cutoff tradeoff,
+   vintages, segments, rejected applications, data quality). Each topic is
+   written by its own model call that sees only that topic's facts, which keeps a
+   small model focused. `ask` and `chat` use one writer for the whole answer.
+5. **Check.** Python checks that every number is copied from the cited facts and
+   that no statement calls a cutoff an approval or rejection. Then a critic pass
+   (on by default, `--no-critic` to skip) shows the model each statement next to
+   only the facts it cites and asks whether it says more than they support.
+   Failing statements get one repair attempt; any that still fail are withheld
+   and listed. The critic is a second model opinion, not proof.
+6. **Edit.** For a report, the model selects validated statements by ID and
+   writes only the headline and next steps, which pass the same checks. If the
+   headline cannot be validated, the run fails and earlier report files are left
+   untouched.
 
 | Tool | Purpose |
 | --- | --- |
@@ -140,6 +158,9 @@ explicit expansion assumptions `--assume-comparable-scores`,
 | `segment_performance` | Disjoint breakdown by score band (what each cutoff step removes), issue year (seasoning), grade or term. |
 | `sweep_loss_ceilings` | How the screening candidate moves across several loss ceilings. |
 | `rejected_applications` | Rejected numeric screens by score era (FICO before 2013-11, VantageScore after) or application year. |
+| `vintage_trend` | Issue vintages by year or quarter, which are seasoned enough to compare, and the change between the earliest and latest seasoned vintage. |
+| `loss_concentration` | Each segment's share of unrecovered principal versus its share of funded principal, and the largest contributors. |
+| `mix_shift` | How the mix of issued loans (score band, grade or term) and the average score change by issue year. |
 
 The model sees fact sentences only. It never sees borrower records, SQL,
 credentials or connection settings, and it cannot set the expansion
@@ -158,12 +179,48 @@ A report folder (default `outputs/framework_report/`; change with
 | `report.md` | Summary, analyst findings with numbered citations, calculated tables, the investigation steps, cited evidence and definitions. |
 | `aggregates.json` | Settings, snapshot provenance, every report-step result and fact, run ID and source evidence hash. |
 | `snapshot.json` | The grouped MySQL aggregates and SQL behind this run; reuse with `--snapshot <folder>/snapshot.json`. |
-| `ollama_analysis.json` | Exact model requests, tool definitions, tool calls and results, the validated answer, withheld statements, model digest and usage (or a disabled status). |
+| `ollama_analysis.json` | Exact model requests, tool definitions, tool calls and results, every drafted statement and critic verdict, the validated answer, withheld statements, model digest and usage (or a disabled status). |
+| `trace.jsonl` | Timing and token counts for each step (no prompts or model text); print it with `trace DIR`. |
 
-Reruns replace these four files. `ask` and `chat` save Markdown and JSON
+Reruns replace these five files. `ask` and `chat` save Markdown and JSON
 transcripts under `outputs/ask/` and `outputs/chat/`. `--no-ai` explicitly
 writes the calculated report without model commentary. `--sections` chooses
 and orders report sections.
+
+## Resuming, measuring and sharing the tools
+
+**Resume.** Every model reply is saved as it arrives. If a report is interrupted
+(Ctrl+C, a timeout, the model-call limit), the message names the run and
+
+```powershell
+.\.venv\Scripts\python.exe -m loan_analyst report --resume
+```
+
+continues it: it reloads that run's own snapshot without querying MySQL and asks
+the model only for what was not finished. Keep the same scenario and model
+options; if they differ, the command stops and names what changed. A run that
+failed evidence validation is not resumable, because the same replies would fail
+again; rerun it with `--snapshot latest`.
+
+**Evaluate.** `evals/cases.toml` holds questions with structural expectations
+(which tools should run, which kinds of fact should be cited, wording that must
+not appear) and seeded statements that test the critic. It contains no data
+values, so it works with any snapshot.
+
+```powershell
+.\.venv\Scripts\python.exe -m loan_analyst eval --snapshot latest
+.\.venv\Scripts\python.exe -m loan_analyst eval --snapshot latest --tool-mode schema --compare-with outputs/evals/<earlier run>/results.json
+```
+
+Each run prints a scorecard and saves it with `results.json` under
+`outputs/evals/`. Use it before adopting another model, prompt or setting. It
+needs the local model and a saved snapshot, never MySQL.
+
+**MCP.** `mcp --snapshot latest` lets another local program (an MCP client)
+list and call the same read-only tools over standard input/output. It requires a
+saved snapshot, never connects to MySQL, opens no network port and takes the
+scenario from its own command line. The connected client receives the calculated
+facts, so connect only clients you trust with them.
 
 ## Team defaults
 
@@ -267,7 +324,7 @@ leave that batch's outcome uncertain. Table creation commits separately.
 Unit tests use isolated fixtures and fake services only inside `tests/`; those
 fixtures are not available as report data sources. They cover calculations, the
 cube and snapshot files, SQL/read-only boundaries, tool validation, the
-tool-calling loop with a scripted model, evidence checks, the report, ask, chat
-and render workflows, importer behavior, credential exclusion, and failure
-preservation. A successful live report separately verifies the actual MySQL and
+planner, writer, critic and editor with a scripted model, evidence checks, the
+report, ask, chat, render, resume, eval and MCP workflows, importer behavior,
+credential exclusion, and failure preservation. A successful live report separately verifies the actual MySQL and
 Ollama integration.

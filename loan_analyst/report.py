@@ -183,6 +183,50 @@ def segment_table(result):
                   "Loss proxy", "Financial coverage"], rows, ["---", *["---:"] * 7])
 
 
+def vintage_table(result):
+    """Issue vintages with their seasoning status."""
+    rows = []
+    for vintage in result["vintages"]:
+        rows.append([
+            vintage["vintage"],
+            f"{vintage['accepted']['rows']:,}",
+            pct(vintage["terminal_share"]),
+            "yes" if vintage["seasoned"] else "no",
+            pct(vintage["chargeoff_rate"]),
+            pct(vintage["loss_rate"]),
+        ])
+    return table(["Vintage", "Loans", "Terminal share", "Seasoned", "Charge-off rate", "Loss proxy"], rows,
+                 ["---", "---:", "---:", "---", "---:", "---:"])
+
+
+def concentration_table(result):
+    """Each segment's share of funded principal and of unrecovered principal."""
+    rows = []
+    for segment in result["segments"]:
+        relative = segment["loss_to_principal_ratio"]
+        rows.append([
+            segment["segment"],
+            f"{segment['complete_loans']:,}",
+            pct(segment["principal_share"]),
+            pct(segment["loss_share"]),
+            "N/A" if relative is None else f"{relative:.2f}",
+        ])
+    return table([TITLES[result["dimension"]], "Complete terminal loans", "Share of funded principal",
+                  "Share of unrecovered principal", "Loss share / principal share"], rows,
+                 ["---", *["---:"] * 4])
+
+
+def mix_table(result):
+    """One row per issue year; one share column per segment."""
+    rows = []
+    for year in result["years"]:
+        average = "N/A" if year["average_score"] is None else f"{year['average_score']:.1f}"
+        rows.append([year["year"], f"{year['loans']:,}", average,
+                     *[pct(segment["loan_share"]) for segment in year["segments"]]])
+    return table(["Issue year", "Issued loans", "Average score", *result["segments"]], rows,
+                 ["---", *["---:"] * (2 + len(result["segments"]))])
+
+
 def rejected_table(result):
     """Rejected applications grouped by score era or application year."""
     baseline = result["baseline"]
@@ -306,6 +350,12 @@ def _analyst(view):
         "tool call(s) of its own. Every statement passed evidence-reference and number checks; interpretations "
         "are model-generated and require review. Tables and cutoff selection are calculated by Python.", "",
     ]
+    reviews = analysis.get("critic_reviews") or []
+    if reviews:
+        flagged = sum(1 for review in reviews if review["verdict"] != "supported")
+        lines += [f"A second model pass reviewed {len(reviews)} statement(s) against their cited facts and "
+                  f"objected to {flagged}; statements still objected to after one repair were withheld. That "
+                  "review is also model-generated: it reduces overstatement but does not prove correctness.", ""]
     if analysis.get("review"):
         lines += ["Wording reviewed against the database evidence. The original model draft and review notes "
                   "are preserved in `ollama_analysis.json`.", ""]
@@ -365,6 +415,46 @@ def _segments(view):
     if not parts:
         return ""
     return "## Performance by grade and term\n\n" + "\n\n".join(parts)
+
+
+def _vintage_trend(view):
+    result = view.result("vintage_trend")
+    if not result:
+        return ""
+    lines = [
+        "## Vintage trend and seasoning", "",
+        f"A vintage is treated as seasoned when at least {pct(result['min_terminal_share'])} of its loans are "
+        "resolved. Only seasoned vintages are compared with each other; the threshold is a reporting choice.", "",
+        vintage_table(result),
+    ]
+    change = result["seasoned_change"]
+    if change:
+        lines += ["", f"Earliest to latest seasoned vintage ({change['first']} to {change['last']}): loss proxy "
+                      f"{pct(change['first_loss_rate'])} to {pct(change['last_loss_rate'])} "
+                      f"({change['change_pp']:+.2f} percentage points). Loan age and mix are not controlled."]
+    return "\n".join(lines)
+
+
+def _concentration(view):
+    parts = []
+    for dimension in ("score_band", "grade"):
+        result = view.result("loss_concentration", dimension=dimension)
+        if result:
+            parts.append(concentration_table(result))
+    if not parts:
+        return ""
+    return ("## Loss concentration\n\nShares are among financially complete terminal loans. A ratio above 1 means "
+            "a segment carries more than a proportional share of historical unrecovered principal; it is "
+            "descriptive, not a limit or a forecast.\n\n" + "\n\n".join(parts))
+
+
+def _mix_shift(view):
+    result = view.result("mix_shift", dimension="score_band")
+    if not result:
+        return ""
+    return ("## Origination mix by issue year\n\nShare of each year's issued loans (open and resolved) in each "
+            "score band, with the loan-weighted average score. Mix describes what was originated; it does not "
+            "by itself explain losses.\n\n" + mix_table(result))
 
 
 def _rejected(view):
@@ -506,7 +596,10 @@ SECTIONS = {
     "cutoffs": _cutoffs,
     "score_bands": _score_bands,
     "vintages": _vintages,
+    "vintage_trend": _vintage_trend,
     "segments": _segments,
+    "concentration": _concentration,
+    "mix_shift": _mix_shift,
     "rejected": _rejected,
     "coverage": _coverage,
     "next_decision": _next_decision,

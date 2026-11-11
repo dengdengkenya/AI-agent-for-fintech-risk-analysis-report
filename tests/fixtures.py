@@ -128,11 +128,13 @@ METADATA = {"model": ModelConfig.model, "model_digest": "test-digest", "server_v
 class ScriptedModel:
     """Replays replies in order (dicts, or callables given the request) and records requests."""
 
-    def __init__(self, replies, config=None):
+    def __init__(self, replies, config=None, default=None):
         self.replies, self.requests, self.metadata, self.config = list(replies), [], None, config
+        self.default = default  # answers every request after the queued replies run out
 
-    def preflight(self):
+    def preflight(self, require_tools=True):
         self.metadata = dict(METADATA)
+        self.required_tools = require_tools
         return self.metadata
 
     def chat(self, messages, *, tools=None, format=None, num_predict=1024):
@@ -143,7 +145,7 @@ class ScriptedModel:
         if format is not None:
             payload["format"] = format
         self.requests.append(payload)
-        reply = self.replies.pop(0)
+        reply = self.replies.pop(0) if self.replies or self.default is None else self.default
         reply = reply(payload) if callable(reply) else reply
         return {"request": payload, "content": reply.get("content", ""), "tool_calls": reply.get("tool_calls", []),
                 "usage": {"prompt_eval_count": 100, "eval_count": 20}}
@@ -180,6 +182,61 @@ def done():
     return {"content": "DONE"}
 
 
+def broken(payload=None):
+    """A reply that is never valid JSON."""
+    return {"content": "{"}
+
+
+def planned(*items):
+    """A schema-mode plan: planned(("tool", {...}), ("topic", "tool", {...}), ...)."""
+    requested = []
+    for item in items:
+        if len(item) == 3:
+            requested.append({"topic": item[0], "tool": item[1], "arguments": item[2]})
+        else:
+            requested.append({"tool": item[0], "arguments": item[1]})
+    return {"content": json.dumps({"calls": requested})}
+
+
+def statement_ids(payload):
+    """The statement IDs a critic request asks about."""
+    return payload["format"]["properties"]["verdicts"]["items"]["properties"]["statement"]["enum"]
+
+
+def verdicts(payload, **overrides):
+    """A critic reply: every statement supported unless overridden, e.g. s1="overreach"."""
+    return {"content": json.dumps({"verdicts": [
+        {"statement": statement_id, "verdict": overrides.get(statement_id, "supported"), "reason": "checked"}
+        for statement_id in statement_ids(payload)]})}
+
+
+def auto(payload):
+    """A sensible valid reply to any request, decided from its structured-output schema.
+
+    No schema: finish investigating. A plan: no calls. A review: all supported.
+    Anything else: one qualitative statement per written section citing the first
+    allowed fact, and the first allowed statement IDs for every selection.
+    """
+    properties = payload.get("format", {}).get("properties")
+    if properties is None:
+        return done()
+    if "calls" in properties:
+        return planned()
+    if "verdicts" in properties:
+        return verdicts(payload)
+
+    answer = {}
+    for name, section in properties.items():
+        items = section["items"]
+        if "properties" in items:
+            first_fact = items["properties"]["evidence_ids"]["items"]["enum"][0]
+            written = [statement(f"A qualitative {name} statement.", first_fact)]
+            answer[name] = written[:section["maxItems"]]
+        else:
+            answer[name] = items["enum"][:section["maxItems"]]
+    return {"content": json.dumps(answer)}
+
+
 def temporary_directory(test, prefix):
     """A temporary folder under outputs/, removed after the test."""
     root = PROJECT_ROOT / "outputs"
@@ -209,7 +266,8 @@ def services(test, *, connection=None, model=None, lines=()):
         return model
 
     wired = Services(connection_factory=connect, model_factory=load_model,
-                     snapshot_dir=temporary_directory(test, "snapshots-test-"), default_config=None,
+                     snapshot_dir=temporary_directory(test, "snapshots-test-"),
+                     runs_dir=temporary_directory(test, "runs-test-"), default_config=None,
                      log=log.append, out=out.append, read_line=read_line,
                      clock=lambda: "2026-11-03T10:30:00+00:00")
     wired.logged, wired.printed = log, out

@@ -214,9 +214,34 @@ class ToolRegistry:
     def names(self):
         return tuple(self._tools)
 
-    def definitions(self):
+    def definitions(self, names=None):
         """Function schemas in the shape Ollama's chat API expects in ``tools``."""
-        return [tool.definition() for tool in self._tools.values()]
+        return [tool.definition() for tool in self._tools.values() if names is None or tool.name in names]
+
+    def action_schema(self, choices, max_calls):
+        """A JSON schema for "the list of tool calls to run next"; an empty list means done.
+
+        ``choices`` is a list of (topic, tool name) pairs; topic is None outside
+        reports. Passing this as a structured-output format constrains the model
+        to registered tool names and argument shapes. It is a convenience for
+        the model, not a safety boundary: call() still validates every request.
+        """
+        variants = []
+        for topic, name in choices:
+            properties = {"tool": {"type": "string", "enum": [name]},
+                          "arguments": deepcopy(self._tools[name].parameters)}
+            required = ["tool", "arguments"]
+            if topic is not None:
+                properties = {"topic": {"type": "string", "enum": [topic]}, **properties}
+                required = ["topic", *required]
+            variants.append({"type": "object", "additionalProperties": False,
+                             "required": required, "properties": properties})
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["calls"],
+            "properties": {"calls": {"type": "array", "maxItems": max_calls, "items": {"anyOf": variants}}},
+        }
 
     def call(self, name, arguments, context, *, sanitize=True):
         """Validate and run one tool, returning either a result or a safe error envelope.
