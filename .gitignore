@@ -3,4 +3,5 @@
 /processed/
 /processed_samples/
 /.venv/
+/.idea/
 __pycache__/

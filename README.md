@@ -328,3 +328,15 @@ planner, writer, critic and editor with a scripted model, evidence checks, the
 report, ask, chat, render, resume, eval and MCP workflows, importer behavior,
 credential exclusion, and failure preservation. A successful live report separately verifies the actual MySQL and
 Ollama integration.
+
+## Data and disclaimer
+
+This repository does not include the Lending Club source data. The ignored
+`data/` path is expected to point at your own copy; check the terms that come
+with those files before using or redistributing them. Generated reports and
+model commentary are illustrative, may be wrong, and are not financial, credit
+or investment advice. This project is not affiliated with Lending Club.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

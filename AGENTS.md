@@ -191,7 +191,7 @@ complete/deduplicated import.
 
 Reporting uses MySQL only. `data/` remains the source for the separate importer
 and dictionary reference. It is a Windows directory junction to
-`C:\Users\kenny\Documents\lending-club-data`; writes through it change originals.
+`<your-local-lending-club-folder>`; writes through it change originals.
 Treat source data as read-only unless explicitly instructed otherwise. Use
 streaming or bounded reads of the large CSVs. Ignore Excel locks named `~$*`.
 
