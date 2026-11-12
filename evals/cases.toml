@@ -25,7 +25,7 @@ kind = "ask"
 question = "Which tested cutoff keeps the historical principal-loss proxy at or below 8%?"
 expect_tools = [{ name = "compare_score_cutoffs", arguments = { max_loss_rate = 0.08 } }]
 expect_cited = ["compare_score_cutoffs:selection"]
-forbid_text = ['\b(approv|den(y|ies)|reject(s|ing)?\b)']
+forbid_text = ['\brecommend(ed|s)? (cutoff|policy)\b']
 
 [[case]]
 id = "ceiling-sweep"
